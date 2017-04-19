@@ -21,7 +21,6 @@ import System.IO.Unsafe             as IO
 
 type AreaCategory = Text
 type AreaCode     = Text
-type IndicatorCode= Text
 type QuandlCode   = Text
 
 data ZCode   = ZCode {
@@ -30,26 +29,60 @@ data ZCode   = ZCode {
   ,quandlCode :: IndicatorCode -> QuandlCode
   }
 
+data IndicatorCode = IC_A   -- --- All Homes
+  |IC_SF   -- Single Family Residences
+  |IC_C   -- Condominiums
+  |IC_MVSF   -- Price per Square Foot
+  |IC_1B   -- 1 Bedroom
+  |IC_2B   -- 2 Bedroom
+  |IC_3B   -- 3 Bedroom
+  |IC_4B   -- 4 Bedroom
+  |IC_5B   -- 5 or More
+  |IC_BT   -- Bottom Tier
+  |IC_MT   -- Middle Tier
+  |IC_TT   -- Top Tier
+  |IC_RMP   -- Median Rent, Homes Listed for Rent
+  |IC_RAH   -- Estimated Rent, All Homes in Region
+  |IC_RZSF   -- Estimated Rent per Square Foot
+  |IC_PRR   -- Price-to-Rent Ratio
+  |IC_MLP   -- Median List Price
+  |IC_MSP   -- Median Sale Price
+  |IC_MLPSF   -- Median List Price per Square Foot
+  |IC_MSPSF   -- Median Sale Price per Square Foot
+  |IC_LPC   -- Listings with Price Cut in Last 30 Days
+  |IC_MPC   -- Median Price Cut
+  |IC_SLPR   -- Ratio of Sale Price to List Price
+  |IC_SFL   -- Sold for Loss
+  |IC_SFG   -- Sold for Gain
+  |IC_IV   -- Increasing Values
+  |IC_DV   -- Decreasing Values
+  |IC_SPY   -- Turnover in Housing Market, Past 1 Year
+  |IC_HR   -- Number of Homes for Rent
+  |IC_HF   -- Monthly Foreclosures per 10,000 Homes
+  |IC_FR   -- Percentage of Sales that were Foreclosures
+  deriving Show
+
 instance Show ZCode where
   show z@(ZCode ac c qc) = concat (Data.Text.unpack <$> [ac,c])
 
-data ZillowR = ZData ZCode
+data ZillowR = ZData ZCode -- A request for information from Zillows db
 
-apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY")
+-- emptyZCode :: Initialise a zillow code using area category and code
+emptyZCode :: AreaCategory -> AreaCode -> ZCode
+emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> (Data.Text.pack (drop 3 (show ic))))
 
-emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> ic)
+c0 = emptyZCode "Z" "90210" -- all homes in the 90210 zip code
 
---turnover for all homes in the 90210 zip code
-c0 = emptyZCode "Z" "90210" -- "SPY"
-
-zillow (ZData code) = do
+zillow (ZData code) ic = do
   Data.Text.putStrLn( qcode )
   Network.Wreq.get url >>= return . (^. Network.Wreq.responseBody)
-    
   where
-    qcode = quandlCode code "SPY"
+    qcode = quandlCode code ic
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?api_key=" ++ apiKey
 
+apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY")
 main = do
-  zillow (ZData c0) >>= LBS.putStrLn
+  zillow (ZData c0) IC_SPY >>= LBS.putStrLn -- turnover for all homes in c0 "SPY"
+  zillow (ZData c0) IC_SFG >>= LBS.putStrLn -- sold for gains
+  zillow (ZData c0) IC_SFL >>= LBS.putStrLn -- sold for losses
 
