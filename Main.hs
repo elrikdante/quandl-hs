@@ -1,6 +1,6 @@
 #!/usr/bin/env stack
 {- --package server-generic --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers --package wai-extra -}
-{-# LANGUAGE RecordWildCards,OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards,OverloadedStrings,ScopedTypeVariables,TupleSections #-}
 module Main where
 import qualified Network.Wreq
 import qualified Data.Vector
@@ -13,10 +13,12 @@ import qualified Data.Text.Encoding as LData.Text
 import qualified Data.Text.Lazy     as LData.Text
 import Data.Set(Set(..))
 import Data.Function ((&))
-import Control.Lens
+import Control.Lens((^.),_Right)
+import Control.Exception(catch,SomeException)
 import Data.Aeson
 import Data.Aeson.Types
-import Data.Monoid
+import Data.Monoid(mappend,(<>))
+import Data.Either(rights)
 import qualified Turtle
 import qualified System.Environment as IO
 import qualified System.IO          as IO
@@ -71,6 +73,9 @@ instance Show ZCode where
 
 data ZillowR = ZData Page ZCode -- A request for information from Zillows db
 
+type ZillowResponse b = Either Error b
+type Error = Text
+
 -- emptyZCode :: Initialise a zillow code using area category and code
 emptyZCode :: AreaCategory -> AreaCode -> ZCode
 emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> (Data.Text.pack (drop 3 (show ic))))
@@ -79,24 +84,36 @@ c0 = emptyZCode "Z" "90210" -- all homes in the 90210 zip code
 edgewater = emptyZCode "N" "00487" 
 brickell = emptyZCode "N" "00332" 
 
-zillow (ZData page code) ic = do
-  Data.Text.putStrLn( qcode )
-  Network.Wreq.get url >>= return . (^. Network.Wreq.responseBody)
+zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse (QuandlCode,LBS.ByteString))
+zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
+                              `Control.Exception.catch`  --catch exceptions.
+                              (\(_::SomeException) -> return (Left "Err"))
   where
     qcode = quandlCode code ic
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?" ++ "page=" ++ (show page) ++ "&api_key=" ++ apiKey
 
-graph tbl code = do 
+-- this calls to a ruby gem called ascii_charts for table rendering.
+graph tbl _ qcode = do 
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
       ("bundle exec ruby ./graph.sh") 
       (return $ LData.Text.decodeUtf8 (LBS.toStrict tbl))
-  Data.Text.putStrLn asciiGraph
+  Data.Text.putStrLn(qcode)     --print table name
+  Data.Text.putStrLn asciiGraph --print ascii table
 
-apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY")
+pg' = pg 0
+pg n zcode = zillow (ZData n zcode)
+
+apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
 
 main = do
-  let queries = [IC_MLP,IC_MSP,IC_SPY,IC_MLP,IC_MSP,IC_RMP,IC_RAH,IC_RZSF]
-      acts =  (zip (repeat (zillow (ZData 0 edgewater))) queries)
-        ++    (zip (repeat (zillow (ZData 0 brickell))) queries)
-  mapM_ (\(action,code) -> action code >>= flip graph code) acts
+  let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
+      acts =        (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
+              ++    (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
+
+  flip mapM_ acts (\(action,code) -> do
+                      result <- action code
+                      case result of
+                        Left _              -> return () -- swallow errors
+                        Right (qcode, rows) -> graph rows code qcode -- graph successful queries
+                  ) 
