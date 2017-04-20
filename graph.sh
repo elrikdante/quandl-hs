@@ -1,4 +1,4 @@
-#!/Users/delrik/.rvm/rubies/ruby-2.3.0/bin/ruby
+#!/usr/bin/env ruby
 require 'ascii_charts'
 require 'json'
 data = JSON(STDIN.read.chomp)
