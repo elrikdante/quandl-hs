@@ -97,14 +97,14 @@ zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode
 
 -- this calls to a ruby gem called ascii_charts for table rendering.
 graph tbl _ qcode = do 
-  let (String name) : (String description) : (Array rows) : _ = let Object recs = maybe emptyObject id $ (
+  let (String name) : (String description) : rows : _ = let Object recs = maybe emptyObject id $ (
                                                                        (decode tbl :: Maybe Value) >>= \(Object kvs) -> 
                                                                          HM.lookup "dataset" kvs)
-                                                                 in mapMaybe (flip HM.lookup recs) ["name","description","data"]
+                                                        in mapMaybe (flip HM.lookup recs) ["name","description","data"]
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
       ("bundle exec ruby ./graph.sh") 
-      (return $ LData.Text.decodeUtf8 (LBS.toStrict tbl))
+      (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
 pg' = pg 0
@@ -121,5 +121,5 @@ main = do
                       result <- action code
                       case result of
                         Left _              -> return () -- swallow errors
-                        Right (qcode, rows) -> graph rows code qcode -- graph successful queries
+                        Right (qcode, rows) -> graph rows code qcode `Control.Exception.catch` (\(_::SomeException) -> return ()) -- graph successful queries
                   ) 
