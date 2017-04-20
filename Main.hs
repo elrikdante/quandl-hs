@@ -9,12 +9,15 @@ import qualified Data.Text
 import qualified Data.ByteString.Lazy as LBS
 import Data.Text(Text)
 import qualified Data.Text.IO as Data.Text
+import qualified Data.Text.Encoding as LData.Text
+import qualified Data.Text.Lazy     as LData.Text
 import Data.Set(Set(..))
 import Data.Function ((&))
 import Control.Lens
 import Data.Aeson
 import Data.Aeson.Types
 import Data.Monoid
+import qualified Turtle
 import qualified System.Environment as IO
 import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
@@ -61,7 +64,7 @@ data IndicatorCode = IC_A   -- --- All Homes
   |IC_HR   -- Number of Homes for Rent
   |IC_HF   -- Monthly Foreclosures per 10,000 Homes
   |IC_FR   -- Percentage of Sales that were Foreclosures
-  deriving Show
+  deriving (Show,Bounded,Enum)
 
 instance Show ZCode where
   show z@(ZCode ac c qc) = concat (Data.Text.unpack <$> [ac,c])
@@ -82,10 +85,16 @@ zillow (ZData page code) ic = do
     qcode = quandlCode code ic
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?" ++ "page=" ++ (show page) ++ "&api_key=" ++ apiKey
 
+graph tbl code = do 
+  (Turtle.ExitSuccess, g) <- Turtle.shellStrict ("bundle exec ruby ./graph.sh") (return $ LData.Text.decodeUtf8 (LBS.toStrict tbl))
+  Data.Text.putStrLn $ Data.Text.pack (concat (take 20 $ repeat "--")) <> Data.Text.pack (show code) <> (Data.Text.pack $ concat (take 20 $ repeat "--"))
+  Data.Text.putStrLn g
+  Data.Text.putStrLn $ Data.Text.pack $ concat (take 50 $ repeat "--")
+
 apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY")
 main = do
-  zillow (ZData 0 c0) IC_SPY >>= LBS.putStrLn -- turnover for all homes in c0 "SPY"
-  zillow (ZData 0 c0) IC_SFG >>= LBS.putStrLn -- sold for gains
-  zillow (ZData 0 c0) IC_SFL >>= LBS.putStrLn -- sold for losses
-  mconcat (zillow (ZData 0 edgewater) <$> [IC_SPY,IC_SFG,IC_SFL]) >>= LBS.putStrLn
+  let acts = zip (repeat (zillow (ZData 0 edgewater))) [IC_MLP,IC_MSP,IC_SPY,IC_MLP,IC_MSP,IC_RMP,IC_RAH,IC_RZSF]
+  mapM_ (\(action,code) -> action code >>= flip graph code) acts
+
+  
 
