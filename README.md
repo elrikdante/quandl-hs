@@ -4,4 +4,4 @@
 # Running It
 
 `./Main.hs`
-![Alt text](/path/to/img.jpg)
+![Zillow Demo](https://github.com/elrikdante/quandl-hs/blob/master/ZillowDemo.gif)
