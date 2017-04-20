@@ -77,6 +77,7 @@ emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> (Data.Text.pac
 
 c0 = emptyZCode "Z" "90210" -- all homes in the 90210 zip code
 edgewater = emptyZCode "N" "00487" 
+brickell = emptyZCode "N" "00332" 
 
 zillow (ZData page code) ic = do
   Data.Text.putStrLn( qcode )
@@ -86,15 +87,16 @@ zillow (ZData page code) ic = do
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?" ++ "page=" ++ (show page) ++ "&api_key=" ++ apiKey
 
 graph tbl code = do 
-  (Turtle.ExitSuccess, g) <- Turtle.shellStrict ("bundle exec ruby ./graph.sh") (return $ LData.Text.decodeUtf8 (LBS.toStrict tbl))
-  Data.Text.putStrLn $ Data.Text.pack (concat (take 20 $ repeat "--")) <> Data.Text.pack (show code) <> (Data.Text.pack $ concat (take 20 $ repeat "--"))
-  Data.Text.putStrLn g
-  Data.Text.putStrLn $ Data.Text.pack $ concat (take 50 $ repeat "--")
+  (Turtle.ExitSuccess, asciiGraph) <- 
+    Turtle.shellStrict 
+      ("bundle exec ruby ./graph.sh") 
+      (return $ LData.Text.decodeUtf8 (LBS.toStrict tbl))
+  Data.Text.putStrLn asciiGraph
 
 apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY")
+
 main = do
-  let acts = zip (repeat (zillow (ZData 0 edgewater))) [IC_MLP,IC_MSP,IC_SPY,IC_MLP,IC_MSP,IC_RMP,IC_RAH,IC_RZSF]
+  let queries = [IC_MLP,IC_MSP,IC_SPY,IC_MLP,IC_MSP,IC_RMP,IC_RAH,IC_RZSF]
+      acts =  (zip (repeat (zillow (ZData 0 edgewater))) queries)
+        ++    (zip (repeat (zillow (ZData 0 brickell))) queries)
   mapM_ (\(action,code) -> action code >>= flip graph code) acts
-
-  
-
