@@ -15,6 +15,7 @@ import qualified Data.Text.Lazy     as LData.Text
 import Data.Set(Set(..))
 import Data.Function ((&))
 import Control.Lens((^.),_Right,view,over)
+import Data.List(intersperse)
 import Control.Exception(catch,SomeException,bracket,finally)
 import Data.Aeson
 import Data.Maybe(mapMaybe,fromJust)
@@ -29,7 +30,7 @@ import qualified Turtle
 import qualified System.Environment as IO
 import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
-
+import qualified Debug.Trace        as DT
 type AreaCategory = Text
 type AreaCode     = Text
 type QuandlCode   = Text
@@ -117,19 +118,12 @@ apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports gith
 ignoreErrors = \(_::SomeException) -> return () :: IO ()
 quietly = flip catch ignoreErrors
 
-pool n tag = Async.newQSem n >>= pure . (,tag)
-data Pair a b = Pair a b
-{-
-tick job p = Control.Exception.bracket 
-             (Async.waitQSem (fst p) >> (print $ ("acquire",snd p))) 
-             (const $ Async.signalQSem (fst p) >> (print $ ("release",snd p))) 
-             (const job)
--}
+throttle n tag = Async.newQSem n >>= pure . (,tag)
+
 tick job p = Control.Exception.bracket 
              (Async.waitQSem (fst p))
              (const $ Async.signalQSem (fst p))
              (const job)
-
 main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
       acts =        (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
@@ -137,33 +131,41 @@ main = do
   pipe     <- Async.newChan
   blocked  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
 
+  -- throttle handles so we can:
+  --  - not hammer quandl
+  --  - fetch network in parallel
+  --  - draw to screen synchronously
+
+  netT <- throttle 4 "Network.IO" 
+  drawT <- throttle 1 "Draw.IO"
+
   let blkIO io = do
         m     <- Async.newEmptyMVar
         queue <- Async.takeMVar blocked
         Async.putMVar blocked (m:queue)
         Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar m ())
 
+  let printAnswers =
+        Async.readChan pipe  >>= \info ->
+        tick (uncurry (flip graph) info) drawT -- throttle drawing so we don't mash graphs
+
   let wait = do
         blk <- Async.takeMVar blocked
         case blk of
-          [] -> return () *> print "done waiting"
-          (finaliser:fs) -> do
-            Async.putMVar blocked fs
-            Async.takeMVar finaliser
-            wait
-
-  let printAnswers =
-        Async.readChan pipe  >>= 
-        uncurry (flip graph) >> 
-        printAnswers
+          []             -> return () -- done waiting
+          (finaliser:fs) ->  Async.putMVar blocked fs *> 
+                             Async.takeMVar finaliser *> 
+                             wait
 
   let loop ((action,code):rest) = (blkIO (do
-                                             x <- action code
+                                             x <- tick (action code) netT --throttle as quandl's API doesn't like being hammered
                                              case x of 
-                                               Left _  -> return ()
+                                               Left _  -> Async.writeChan pipe ("","") -- :f MVars.. blocking .. etc.
                                                Right a -> Async.writeChan pipe a
                                              )) : loop rest
       loop [] =  []
   let p = blkIO (printAnswers)
-  sequenceA (p:loop acts) `Control.Exception.finally` wait
+  --sprinkle in printing otherwise all the network IO will be completed before a single graph is drawn.
+  --see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
+  sequenceA (intersperse p (loop acts)) `Control.Exception.finally` wait
 
