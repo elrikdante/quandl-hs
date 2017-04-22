@@ -136,14 +136,12 @@ main = do
   --  - fetch network in parallel
   --  - draw to screen synchronously
 
-  netT <- throttle 4 "Network.IO" 
+  netT <- throttle 2 "Network.IO" 
   drawT <- throttle 1 "Draw.IO"
 
   let blkIO io = do
-        m     <- Async.newEmptyMVar
-        queue <- Async.takeMVar blocked
-        Async.putMVar blocked (m:queue)
-        Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar m ())
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \blkd -> Async.putMVar blocked blkd >> return blkd
+        Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
 
   let printAnswers =
         Async.readChan pipe  >>= \info ->
