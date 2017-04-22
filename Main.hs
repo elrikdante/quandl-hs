@@ -140,10 +140,10 @@ main = do
   drawT <- throttle 1 "Draw.IO"
 
   let blkIO io = do
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \x -> (return x <* Async.putMVar blocked x)
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \q -> (return q <* Async.putMVar blocked q)
         Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
 
-  let printAnswers =
+  let printAnswers = blkIO $
         Async.readChan pipe  >>= \info ->
         tick (uncurry (flip graph) info) drawT -- throttle drawing so we don't mash graphs
 
@@ -162,8 +162,7 @@ main = do
                                                Right a -> Async.writeChan pipe a
                                              )) : loop rest
       loop [] =  []
-  let p = blkIO (printAnswers)
   --sprinkle in printing otherwise all the network IO will be completed before a single graph is drawn.
   --see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
-  sequenceA (intersperse p (loop acts)) `Control.Exception.finally` wait
+  sequenceA (intersperse printAnswers (loop acts)) `Control.Exception.finally` wait
 
