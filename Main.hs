@@ -14,14 +14,17 @@ import qualified Data.Text.Encoding as LData.Text
 import qualified Data.Text.Lazy     as LData.Text
 import Data.Set(Set(..))
 import Data.Function ((&))
-import Control.Lens((^.),_Right)
-import Control.Exception(catch,SomeException)
+import Control.Lens((^.),_Right,view,over)
+import Control.Exception(catch,SomeException,bracket,finally)
 import Data.Aeson
 import Data.Maybe(mapMaybe,fromJust)
-import Control.Monad(join,liftM)
+import Control.Monad
 import Data.Aeson.Types
 import Data.Monoid(mappend,(<>))
 import Data.Either(rights)
+import qualified Control.Concurrent.QSem as Async
+import qualified Control.Concurrent      as Async
+import qualified Control.Concurrent.Async as Async
 import qualified Turtle
 import qualified System.Environment as IO
 import qualified System.IO          as IO
@@ -90,13 +93,13 @@ brickell = emptyZCode "N" "00332"
 zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse (QuandlCode,LBS.ByteString))
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
                               `Control.Exception.catch`  --catch exceptions.
-                              (\(_::SomeException) -> return (Left "Err"))
+                              (\(_::SomeException) -> return (Left ("Zillow Err: " <> qcode)))
   where
     qcode = quandlCode code ic
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?" ++ "page=" ++ (show page) ++ "&api_key=" ++ apiKey
 
 -- this calls to a ruby gem called ascii_charts for table rendering.
-graph tbl _ qcode = do 
+graph tbl qcode = do 
   let (String name) : (String description) : rows : _ = let Object recs = maybe emptyObject id $ (
                                                                        (decode tbl :: Maybe Value) >>= \(Object kvs) -> 
                                                                          HM.lookup "dataset" kvs)
@@ -111,15 +114,56 @@ pg' = pg 0
 pg n zcode = zillow (ZData n zcode)
 
 apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
+ignoreErrors = \(_::SomeException) -> return () :: IO ()
+quietly = flip catch ignoreErrors
+
+pool n tag = Async.newQSem n >>= pure . (,tag)
+data Pair a b = Pair a b
+{-
+tick job p = Control.Exception.bracket 
+             (Async.waitQSem (fst p) >> (print $ ("acquire",snd p))) 
+             (const $ Async.signalQSem (fst p) >> (print $ ("release",snd p))) 
+             (const job)
+-}
+tick job p = Control.Exception.bracket 
+             (Async.waitQSem (fst p))
+             (const $ Async.signalQSem (fst p))
+             (const job)
 
 main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
       acts =        (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
               ++    (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
+  pipe     <- Async.newChan
+  blocked  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
 
-  flip mapM_ acts (\(action,code) -> do
-                      result <- action code
-                      case result of
-                        Left _              -> return () -- swallow errors
-                        Right (qcode, rows) -> graph rows code qcode `Control.Exception.catch` (\(_::SomeException) -> return ()) -- graph successful queries
-                  ) 
+  let blkIO io = do
+        m     <- Async.newEmptyMVar
+        queue <- Async.takeMVar blocked
+        Async.putMVar blocked (m:queue)
+        Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar m ())
+
+  let wait = do
+        blk <- Async.takeMVar blocked
+        case blk of
+          [] -> return () *> print "done waiting"
+          (finaliser:fs) -> do
+            Async.putMVar blocked fs
+            Async.takeMVar finaliser
+            wait
+
+  let printAnswers =
+        Async.readChan pipe  >>= 
+        uncurry (flip graph) >> 
+        printAnswers
+
+  let loop ((action,code):rest) = (blkIO (do
+                                             x <- action code
+                                             case x of 
+                                               Left _  -> return ()
+                                               Right a -> Async.writeChan pipe a
+                                             )) : loop rest
+      loop [] =  []
+  let p = blkIO (printAnswers)
+  sequenceA (p:loop acts) `Control.Exception.finally` wait
+
