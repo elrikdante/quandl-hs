@@ -94,7 +94,7 @@ brickell = emptyZCode "N" "00332"
 zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse (QuandlCode,LBS.ByteString))
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
                               `Control.Exception.catch`  --catch exceptions.
-                              (\(_::SomeException) -> return (Left ("Zillow Err: " <> qcode)))
+                              (\(_::SomeException) -> return (DT.trace (Data.Text.unpack $ "Zillow Err: " <> qcode) $ Left ("Zillow Err: " <> qcode)))
   where
     qcode = quandlCode code ic
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?" ++ "page=" ++ (show page) ++ "&api_key=" ++ apiKey
@@ -140,7 +140,7 @@ main = do
   drawT <- throttle 1 "Draw.IO"
 
   let blkIO io = do
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \blkd -> Async.putMVar blocked blkd >> return blkd
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \x -> (return x <* Async.putMVar blocked x)
         Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
 
   let printAnswers =
