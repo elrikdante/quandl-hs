@@ -108,7 +108,7 @@ graph tbl qcode = do
                                                         in mapMaybe (flip HM.lookup recs) ["name","description","data"]
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [];STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
+      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [];STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
       (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
@@ -137,7 +137,7 @@ main = do
   -- pipe for threads to broadcast into
   pipe     <- Async.newChan
   -- list of finalisers we need to garbage collect.
-  blocked  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
+  ioQ  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
 
   -- throttle handles so we can:
   --  - not hammer quandl (rate-limit)
@@ -150,14 +150,14 @@ main = do
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \q -> (return q <* Async.putMVar blocked q)
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= \q -> (return q <* Async.putMVar ioQ q)
         Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
 
   let wait = do
-        blk <- Async.takeMVar blocked
-        case blk of
+        q <- Async.takeMVar ioQ
+        case q of
           []             -> return () -- done waiting
-          (finaliser:fs) ->  Async.putMVar blocked fs *> 
+          (finaliser:fs) ->  Async.putMVar ioQ fs *> 
                              Async.takeMVar finaliser *> 
                              wait
   -- throttle drawing so we don't mash graphs
