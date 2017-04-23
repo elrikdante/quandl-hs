@@ -3,7 +3,8 @@
 {-# LANGUAGE RecordWildCards,OverloadedStrings,ScopedTypeVariables,TupleSections #-}
 module Main where
 import qualified Network.Wreq
-import qualified Data.Vector
+import qualified Data.Vector 
+import Data.Vector (Vector)
 import qualified Data.Set as Set
 import qualified Data.Text
 import qualified Data.ByteString.Lazy as LBS
@@ -102,13 +103,16 @@ zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode
 
 -- this calls to a ruby gem called ascii_charts for table rendering.
 graph tbl qcode = do 
-  let (String name) : (String description) : rows : _ = let Object recs = maybe emptyObject id $ (
-                                                                       (decode tbl :: Maybe Value) >>= \(Object kvs) -> 
-                                                                         HM.lookup "dataset" kvs)
+  let (String name) : (String description) : rows : _ = let Object recs = fromJust $ 
+                                                                    (decode tbl >>= \(Object kvs) -> HM.lookup "dataset" kvs) 
+                                                                <|> pure (object ["name" .= String qcode
+                                                                                ,"description" .= Null
+                                                                                ,"data" .= Null])
                                                         in mapMaybe (flip HM.lookup recs) ["name","description","data"]
+      _ = rows :: Value
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [];STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
+      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
       (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
@@ -173,8 +177,8 @@ main = do
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
   let loop ((action,code):frames) = 
-        let frame = (blkIO ((Async.writeChan pipe <=< flip tick (action code)) netT))
-        in  tick forkT frame : printAnswers : loop frames
+        let frame = tick forkT (blkIO ((Async.writeChan pipe <=< flip tick (action code)) netT))
+        in  frame : printAnswers : loop frames
       loop _ =  []
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
   sequenceA (loop acts) `Control.Exception.finally` wait
