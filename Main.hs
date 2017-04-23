@@ -142,8 +142,10 @@ main = do
   --  - not hammer quandl (rate-limit)
   --  - fetch network concurrently
   --  - draw to screen synchronously
+  --  - throttle forking
   netT  <- throttle 2 "Network.IO" 
   drawT <- throttle 1 "Draw.IO"
+  forkT <- throttle 4 "Fork.IO"
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do
@@ -161,7 +163,8 @@ main = do
   -- throttle drawing so we don't mash graphs
   let printAnswers = blkIO $ Async.readChan pipe  >>= flip tick drawT  . uncurry (flip graph)
 
-  let loop ((action,code):rest) = (blkIO (do
+  -- throttle forking because why not? 
+  let loop ((action,code):rest) = flip tick forkT (blockIO (do
                                              x <- tick (action code) netT --throttle as quandl's API doesn't like being hammered
                                              case x of 
                                                Left _  -> Async.writeChan pipe ("","") -- :f MVars.. blocking .. etc.
