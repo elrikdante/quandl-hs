@@ -90,6 +90,7 @@ emptyZCode :: AreaCategory -> AreaCode -> ZCode
 emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> (Data.Text.pack (drop 3 (show ic))))
 
 c0 = emptyZCode "Z" "90210" -- all homes in the 90210 zip code
+expositionLA= emptyZCode "Z" "90037"
 edgewater = emptyZCode "N" "00487" 
 brickell = emptyZCode "N" "00332" 
 la = emptyZCode "N" "00014" 
@@ -159,7 +160,7 @@ zillowProgram acts = do
   --  - throttle forking
   netT  <- throttle 2 "Network.IO" 
   drawT <- throttle 1 "Draw.IO"
-  forkT <- throttle 4 "Fork.IO"
+  forkT <- throttle 8 "Fork.IO"
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do 
@@ -192,3 +193,4 @@ main = do
   zillowProgram $ (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
                ++ (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
                ++ (zip (repeat $ pg' la ) queries)       -- pull latest info on LA
+               ++ (zip (repeat $ pg' expositionLA ) queries)  -- pull latest info on Exposition,LA
