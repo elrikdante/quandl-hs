@@ -107,7 +107,7 @@ graph tbl qcode = do
                                                         in mapMaybe (flip HM.lookup recs) ["name","description","data"]
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("bundle exec ruby ./graph.sh") 
+      ("ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [];STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
       (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
