@@ -113,7 +113,7 @@ graph tbl qcode = do
       _ = rows :: Value
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
+      ("ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
       (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
@@ -129,7 +129,7 @@ type ThrottleHandle rsc = (Async.QSem,rsc)
 -- create n resource handles.
 -- the program runs concurrently but the concurrency can be limited
 -- 1 -> sequential execution
--- 0 < n > 1 -> concurrent execution limited to at most n
+-- n > 1 -> concurrent execution limited to at most n
 throttle :: Int -> rsc -> IO (ThrottleHandle rsc)
 throttle n tag
   | n < 1     = error "throttle. : allocating 0 is fun if you like playing with blocked threads =)"
@@ -184,7 +184,7 @@ zillowProgram acts = do
         in  frame : printAnswers : go frames
       go _ =  []
 
-  sequence_ (go acts) <* wait
+  sequenceA (go acts) <* wait
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
 
 main = do
