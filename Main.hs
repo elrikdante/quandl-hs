@@ -27,7 +27,7 @@ import qualified Control.Concurrent.QSem as Async
 import qualified Control.Concurrent      as Async
 import qualified Control.Concurrent.Async as Async
 import qualified Turtle
-import Turtle((<=<))
+import Turtle((<=<),(<|>))
 import qualified System.Environment as IO
 import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
@@ -115,20 +115,24 @@ graph tbl qcode = do
 pg' = pg 0
 pg n zcode = zillow (ZData n zcode)
 
-apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
+apiKey       = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
 ignoreErrors = \(_::SomeException) -> return () :: IO ()
-quietly = flip catch ignoreErrors
+quietly      = flip catch ignoreErrors
 
 -- create n resource handles.
 -- allocating 0 is fun if you like playing with blocked threads =)
-throttle n tag = Async.newQSem n >>= pure . (,tag)
+throttle n tag
+  | n < 1     = error "allocating 0 is fun if you like playing with blocked threads =)"
+  | otherwise = Async.newQSem n >>= pure . (,tag)
 
--- use all this machinery to allocate a precious semaphore
--- then shun it.
+-- allocate a semaphore
 tick p job = Control.Exception.bracket 
              (Async.waitQSem (fst p))
              (const $ Async.signalQSem (fst p))
              (const job)
+
+newtype ZillowM m a = ZillowM { runZillowM :: a -> m a }
+
 main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
       acts =        (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
@@ -150,12 +154,11 @@ main = do
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do 
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> Async.putMVar ioQ q *> return q)
-        Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> return q <* Async.putMVar ioQ q)
+        Async.forkIO (quietly io `finally` Async.putMVar finaliser ())
 
   -- writing the last bind (Async.putMVar ioQ *> return) in point free results in : 
   -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
-
   let wait = do
         q <- Async.takeMVar ioQ
         case q of
@@ -163,14 +166,15 @@ main = do
           (finaliser:fs) ->  Async.putMVar ioQ fs *> 
                              Async.takeMVar finaliser *> 
                              wait
+
   -- throttle drawing so we don't mash graphs
-  let printAnswers = blkIO $ Async.readChan pipe  >>= tick drawT  . uncurry (flip graph) . (^._Right)
+  let printAnswers = blkIO $ Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
 
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
-  let loop ((action,code):rest) = 
-        let h = (blkIO ((Async.writeChan pipe <=< flip tick (action code)) netT))
-        in  tick forkT h : loop rest
-      loop [] =  []
+  let loop ((action,code):frames) = 
+        let frame = (blkIO ((Async.writeChan pipe <=< flip tick (action code)) netT))
+        in  tick forkT frame : printAnswers : loop frames
+      loop _ =  []
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
-  sequenceA (loop acts) *> (sequenceA (take (length acts) (repeat printAnswers))) `Control.Exception.finally` wait
+  sequenceA (loop acts) `Control.Exception.finally` wait
