@@ -125,7 +125,7 @@ throttle n tag = Async.newQSem n >>= pure . (,tag)
 
 -- use all this machinery to allocate a precious semaphore
 -- then shun it.
-tick job p = Control.Exception.bracket 
+tick p job = Control.Exception.bracket 
              (Async.waitQSem (fst p))
              (const $ Async.signalQSem (fst p))
              (const job)
@@ -149,9 +149,12 @@ main = do
   forkT <- throttle 4 "Fork.IO"
 
   -- Copied from: [1] - just formatted to my preference
-  let blkIO io = do
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= \q -> (return q <* Async.putMVar ioQ q)
+  let blkIO io = do 
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> Async.putMVar ioQ q *> return q)
         Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
+
+  -- writing the last bind (Async.putMVar ioQ *> return) in point free results in : 
+  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
 
   let wait = do
         q <- Async.takeMVar ioQ
@@ -161,13 +164,13 @@ main = do
                              Async.takeMVar finaliser *> 
                              wait
   -- throttle drawing so we don't mash graphs
-  let printAnswers = blkIO $ Async.readChan pipe  >>= flip tick drawT  . uncurry (flip graph) . (^._Right)
+  let printAnswers = blkIO $ Async.readChan pipe  >>= tick drawT  . uncurry (flip graph) . (^._Right)
 
-  -- throttle forking because why not? 
+  -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
   let loop ((action,code):rest) = 
-        let h = (blkIO ((Async.writeChan pipe <=< tick (action code)) netT))
-        in  flip tick forkT h : loop rest
+        let h = (blkIO ((Async.writeChan pipe <=< flip tick (action code)) netT))
+        in  tick forkT h : loop rest
       loop [] =  []
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
   sequenceA (loop acts) *> (sequenceA (take (length acts) (repeat printAnswers))) `Control.Exception.finally` wait
