@@ -118,8 +118,12 @@ apiKey = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports gith
 ignoreErrors = \(_::SomeException) -> return () :: IO ()
 quietly = flip catch ignoreErrors
 
+-- create n resource handles.
+-- allocating 0 is fun if you like playing with blocked threads =)
 throttle n tag = Async.newQSem n >>= pure . (,tag)
 
+-- use all this machinery to allocate a precious semaphore
+-- then shun it.
 tick job p = Control.Exception.bracket 
              (Async.waitQSem (fst p))
              (const $ Async.signalQSem (fst p))
@@ -128,24 +132,23 @@ main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
       acts =        (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
               ++    (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
+
+  -- pipe for threads to broadcast into
   pipe     <- Async.newChan
+  -- list of finalisers we need to garbage collect.
   blocked  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
 
   -- throttle handles so we can:
-  --  - not hammer quandl
-  --  - fetch network in parallel
+  --  - not hammer quandl (rate-limit)
+  --  - fetch network concurrently
   --  - draw to screen synchronously
-
-  netT <- throttle 2 "Network.IO" 
+  netT  <- throttle 2 "Network.IO" 
   drawT <- throttle 1 "Draw.IO"
 
+  -- Copied from: [1] - just formatted to my preference
   let blkIO io = do
         (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar blocked) >>= \q -> (return q <* Async.putMVar blocked q)
         Async.forkIO (quietly io `Control.Exception.finally` Async.putMVar finaliser ())
-
-  let printAnswers = blkIO $
-        Async.readChan pipe  >>= \info ->
-        tick (uncurry (flip graph) info) drawT -- throttle drawing so we don't mash graphs
 
   let wait = do
         blk <- Async.takeMVar blocked
@@ -155,6 +158,9 @@ main = do
                              Async.takeMVar finaliser *> 
                              wait
 
+  -- throttle drawing so we don't mash graphs
+  let printAnswers = blkIO $ Async.readChan pipe  >>= flip tick drawT  . uncurry (flip graph)
+
   let loop ((action,code):rest) = (blkIO (do
                                              x <- tick (action code) netT --throttle as quandl's API doesn't like being hammered
                                              case x of 
@@ -163,6 +169,6 @@ main = do
                                              )) : loop rest
       loop [] =  []
   --sprinkle in printing otherwise all the network IO will be completed before a single graph is drawn.
-  --see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
+  --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
   sequenceA (intersperse printAnswers (loop acts)) `Control.Exception.finally` wait
 
