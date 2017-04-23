@@ -92,6 +92,7 @@ emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> (Data.Text.pac
 c0 = emptyZCode "Z" "90210" -- all homes in the 90210 zip code
 edgewater = emptyZCode "N" "00487" 
 brickell = emptyZCode "N" "00332" 
+la = emptyZCode "N" "00014" 
 
 zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse (QuandlCode,LBS.ByteString))
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
@@ -123,25 +124,29 @@ apiKey       = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl support
 ignoreErrors = \(_::SomeException) -> return () :: IO ()
 quietly      = flip catch ignoreErrors
 
+type ThrottleHandle rsc = (Async.QSem,rsc)
+
 -- create n resource handles.
--- allocating 0 is fun if you like playing with blocked threads =)
+-- the program runs concurrently but the concurrency can be limited
+-- 1 -> sequential execution
+-- 0 < n > 1 -> concurrent execution limited to at most n
+throttle :: Int -> rsc -> IO (ThrottleHandle rsc)
 throttle n tag
-  | n < 1     = error "allocating 0 is fun if you like playing with blocked threads =)"
+  | n < 1     = error "throttle. : allocating 0 is fun if you like playing with blocked threads =)"
   | otherwise = Async.newQSem n >>= pure . (,tag)
 
--- allocate a semaphore
+-- block until a handle is available, process the job and release the handle
+-- this is guaranteed not to leak resources.
+tick :: forall rsc. (forall a. ThrottleHandle rsc -> IO a -> IO a)
 tick p job = Control.Exception.bracket 
              (Async.waitQSem (fst p))
              (const $ Async.signalQSem (fst p))
              (const job)
 
-newtype ZillowM m a = ZillowM { runZillowM :: a -> m a }
-
-main = do
-  let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
-      acts =        (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
-              ++    (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
-
+-- run a set of queries againsts Zillow's Quandl Database.
+-- each query will be printed as a an ascii_graph
+-- some queries may fail, there is no retry.
+zillowProgram acts = do
   -- pipe for threads to broadcast into
   pipe     <- Async.newChan
   -- list of finalisers we need to garbage collect.
@@ -170,15 +175,20 @@ main = do
           (finaliser:fs) ->  Async.putMVar ioQ fs *> 
                              Async.takeMVar finaliser *> 
                              wait
-
   -- throttle drawing so we don't mash graphs
   let printAnswers = blkIO $ Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
-
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
-  let loop ((action,code):frames) = 
-        let frame = tick forkT (blkIO ((Async.writeChan pipe <=< flip tick (action code)) netT))
-        in  frame : printAnswers : loop frames
-      loop _ =  []
+  let go ((action,code):frames) = 
+        let frame = tick forkT (blkIO (netT & (Async.writeChan pipe <=< flip tick (action code))))
+        in  frame : printAnswers : go frames
+      go _ =  []
+
+  sequence_ (go acts) <* wait
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
-  sequenceA (loop acts) `Control.Exception.finally` wait
+
+main = do
+  let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
+  zillowProgram $ (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
+               ++ (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
+               ++ (zip (repeat $ pg' la ) queries)       -- pull latest info on LA
