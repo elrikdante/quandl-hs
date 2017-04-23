@@ -27,6 +27,7 @@ import qualified Control.Concurrent.QSem as Async
 import qualified Control.Concurrent      as Async
 import qualified Control.Concurrent.Async as Async
 import qualified Turtle
+import Turtle((<=<))
 import qualified System.Environment as IO
 import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
@@ -159,17 +160,14 @@ main = do
           (finaliser:fs) ->  Async.putMVar blocked fs *> 
                              Async.takeMVar finaliser *> 
                              wait
-
   -- throttle drawing so we don't mash graphs
-  let printAnswers = blkIO $ Async.readChan pipe  >>= flip tick drawT  . uncurry (flip graph)
+  let printAnswers = blkIO $ Async.readChan pipe  >>= flip tick drawT  . uncurry (flip graph) . (^._Right)
 
   -- throttle forking because why not? 
-  let loop ((action,code):rest) = flip tick forkT (blkIO (do
-                                             x <- tick (action code) netT --throttle as quandl's API doesn't like being hammered
-                                             case x of 
-                                               Left _  -> Async.writeChan pipe ("","") -- :f MVars.. blocking .. etc.
-                                               Right a -> Async.writeChan pipe a
-                                             )) : loop rest
+  -- throttle network too as quandl's API doesn't like being hammered
+  let loop ((action,code):rest) = 
+        let h = (blkIO ((Async.writeChan pipe <=< tick (action code)) netT))
+        in  flip tick forkT h : loop rest
       loop [] =  []
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
   sequenceA (loop acts) *> (sequenceA (take (length acts) (repeat printAnswers))) `Control.Exception.finally` wait
