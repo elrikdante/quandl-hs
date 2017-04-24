@@ -112,7 +112,7 @@ graph tbl qcode = do
       _ = rows :: Value
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
+      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data, bar: true).draw)'") 
       -- this runs much faster if bundle exec is removed from here,
       -- but ascii_charts will need to be installed on system gems as well.
       -- gem install ascii_charts
@@ -173,13 +173,15 @@ zillowProgram acts = do
           (finaliser:fs) ->  Async.putMVar ioQ fs *> 
                              Async.takeMVar finaliser *> 
                              wait
+
   -- throttle drawing so we don't mash graphs
-  let printAnswers = blkIO $ Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
   let go ((action,code):frames) = 
-        let frame = tick forkT (blkIO (netT & (Async.writeChan pipe <=< flip tick (action code))))
-        in  blkIO (frame >> return ()) : printAnswers : go frames
+        let 
+          frame        = netT & (Async.writeChan pipe <=< flip tick (action code))
+          printAnswers = Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
+        in  tick forkT (blkIO (frame *>  printAnswers)) : go frames
       go _ =  []
 
   sequenceA (go acts) <* wait
