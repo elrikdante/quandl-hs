@@ -146,7 +146,7 @@ tick p job = Control.Exception.bracket_
              job
 
 -- run a set of queries againsts Zillow's Quandl Database.
--- each query will be printed as a an ascii_graph
+-- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
 zillowProgram acts = do
   -- pipe for threads to broadcast into
@@ -179,7 +179,7 @@ zillowProgram acts = do
   -- throttle network too as quandl's API doesn't like being hammered
   let go ((action,code):frames) = 
         let frame = tick forkT (blkIO (netT & (Async.writeChan pipe <=< flip tick (action code))))
-        in  frame : printAnswers : go frames
+        in  blkIO (frame >> return ()) : printAnswers : go frames
       go _ =  []
 
   sequenceA (go acts) <* wait
@@ -189,6 +189,6 @@ main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
   zillowProgram $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
                ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
-               ++ (zip (repeat $ pg' losAngelesCA ) queries)       -- pull latest info on LA
-               ++ (zip (repeat $ pg' expositionCA ) queries)  -- pull latest info on Exposition,LA
+               ++ (zip (repeat $ pg' losAngelesCA ) queries) -- pull latest info on LA
+               ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
                ++ (zip (repeat $ pg' c0 ) queries)
