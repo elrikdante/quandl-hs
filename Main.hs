@@ -157,7 +157,7 @@ zillowProgram acts = do
   -- throttle handles so we can:
   netT  <- throttle 2 "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
   drawT <- throttle 1 "Draw.IO"    -- draw to screen synchronously
-  forkT <- throttle 4 "Fork.IO"    -- throttle forking
+  forkT <- throttle 2 "Fork.IO"    -- throttle forking
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do 
@@ -184,7 +184,7 @@ zillowProgram acts = do
         in  tick forkT (blkIO (frame *>  printAnswers)) : go frames
       go _ =  []
 
-  sequenceA (go acts) <* wait
+  sequence_ (go acts) *> wait
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
 
 main = do
