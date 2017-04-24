@@ -1,23 +1,20 @@
 #!/usr/bin/env stack
-{- --package server-generic --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers --package wai-extra -}
-{-# LANGUAGE RecordWildCards,OverloadedStrings,ScopedTypeVariables,TupleSections #-}
+{- --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
+{-# LANGUAGE OverloadedStrings,ScopedTypeVariables,TupleSections #-}
 module Main where
 import qualified Network.Wreq
-import qualified Data.Vector 
 import Data.Vector (Vector)
-import qualified Data.Set as Set
+import qualified Data.Vector 
+import Data.Text(Text)
 import qualified Data.Text
 import qualified Data.ByteString.Lazy as LBS
-import Data.Text(Text)
 import qualified Data.HashMap.Strict as HM
 import qualified Data.Text.IO as Data.Text
 import qualified Data.Text.Encoding as LData.Text
 import qualified Data.Text.Lazy     as LData.Text
-import Data.Set(Set(..))
 import Data.Function ((&))
 import Control.Lens((^.),_Right,view,over)
-import Data.List(intersperse)
-import Control.Exception(catch,SomeException,bracket,finally)
+import Control.Exception(catch,SomeException,bracket_,finally,handle)
 import Data.Aeson
 import Data.Maybe(mapMaybe,fromJust)
 import Control.Monad
@@ -33,6 +30,7 @@ import qualified System.Environment as IO
 import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
 import qualified Debug.Trace        as DT
+
 type AreaCategory = Text
 type AreaCode     = Text
 type QuandlCode   = Text
@@ -90,10 +88,10 @@ emptyZCode :: AreaCategory -> AreaCode -> ZCode
 emptyZCode ac c = ZCode ac c (\ic -> "Zill/" <> ac <> c <> "_" <> (Data.Text.pack (drop 3 (show ic))))
 
 c0 = emptyZCode "Z" "90210" -- all homes in the 90210 zip code
-expositionLA= emptyZCode "Z" "90037"
-edgewater = emptyZCode "N" "00487" 
-brickell = emptyZCode "N" "00332" 
-la = emptyZCode "N" "00014" 
+expositionCA= emptyZCode "Z" "90037"
+edgewaterFL   = emptyZCode "N" "00487" 
+brickellFL    = emptyZCode "N" "00332" 
+losAngelesCA  = emptyZCode "N" "00014" 
 
 zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse (QuandlCode,LBS.ByteString))
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
@@ -114,7 +112,10 @@ graph tbl qcode = do
       _ = rows :: Value
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
+      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(20), bar: true).draw)'") 
+      -- this runs much faster if bundle exec is removed from here,
+      -- but ascii_charts will need to be installed on system gems as well.
+      -- gem install ascii_charts
       (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
@@ -122,8 +123,8 @@ pg' = pg 0
 pg n zcode = zillow (ZData n zcode)
 
 apiKey       = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
-ignoreErrors = \(_::SomeException) -> return () :: IO ()
-quietly      = flip catch ignoreErrors
+ignoreErrors = Control.Exception.handle (\(_::SomeException) -> return ())
+quietly      = ignoreErrors
 
 type ThrottleHandle rsc = (Async.QSem,rsc)
 
@@ -139,34 +140,30 @@ throttle n tag
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
 tick :: forall rsc. (forall a. ThrottleHandle rsc -> IO a -> IO a)
-tick p job = Control.Exception.bracket 
+tick p job = Control.Exception.bracket_
              (Async.waitQSem (fst p))
-             (const $ Async.signalQSem (fst p))
-             (const job)
+             (Async.signalQSem (fst p))
+             job
 
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as a an ascii_graph
 -- some queries may fail, there is no retry.
 zillowProgram acts = do
   -- pipe for threads to broadcast into
-  pipe     <- Async.newChan
+  pipe <- Async.newChan
   -- list of finalisers we need to garbage collect.
   ioQ  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
 
   -- throttle handles so we can:
-  --  - not hammer quandl (rate-limit)
-  --  - fetch network concurrently
-  --  - draw to screen synchronously
-  --  - throttle forking
-  netT  <- throttle 2 "Network.IO" 
-  drawT <- throttle 1 "Draw.IO"
-  forkT <- throttle 8 "Fork.IO"
+  netT  <- throttle 2 "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
+  drawT <- throttle 1 "Draw.IO"    -- draw to screen synchronously
+  forkT <- throttle 4 "Fork.IO"    -- throttle forking
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do 
         (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> return q <* Async.putMVar ioQ q)
         Async.forkIO (quietly io `finally` Async.putMVar finaliser ())
-
+ 
   -- writing the last bind (Async.putMVar ioQ *> return) in point free results in : 
   -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
   let wait = do
@@ -190,7 +187,7 @@ zillowProgram acts = do
 
 main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
-  zillowProgram $ (zip (repeat $ pg' edgewater) queries) -- pull latest info on edgewater
-               ++ (zip (repeat $ pg' brickell ) queries) -- pull latest info on brickell
-               ++ (zip (repeat $ pg' la ) queries)       -- pull latest info on LA
-               ++ (zip (repeat $ pg' expositionLA ) queries)  -- pull latest info on Exposition,LA
+  zillowProgram $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
+               ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
+               ++ (zip (repeat $ pg' losAngelesCA ) queries)       -- pull latest info on LA
+               ++ (zip (repeat $ pg' expositionCA ) queries)  -- pull latest info on Exposition,LA
