@@ -106,7 +106,7 @@ graph tbl qcode = do
   let (String name) : (String description) : rows : _ = let Object recs = fromJust $ 
                                                                     (decode tbl >>= \(Object kvs) -> HM.lookup "dataset" kvs) 
                                                                 <|> pure (object ["name" .= String qcode
-                                                                                ,"description" .= Null
+                                                                                ,"description" .= String (qcode <> ": This graph failed to load")
                                                                                 ,"data" .= Null])
                                                         in mapMaybe (flip HM.lookup recs) ["name","description","data"]
       _ = rows :: Value
@@ -191,3 +191,4 @@ main = do
                ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
                ++ (zip (repeat $ pg' losAngelesCA ) queries)       -- pull latest info on LA
                ++ (zip (repeat $ pg' expositionCA ) queries)  -- pull latest info on Exposition,LA
+               ++ (zip (repeat $ pg' c0 ) queries)
