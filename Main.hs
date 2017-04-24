@@ -149,8 +149,6 @@ tick p job = Control.Exception.bracket_
 -- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
 zillowProgram acts = do
-  -- pipe for threads to broadcast into
-  pipe <- Async.newChan
   -- list of finalisers we need to garbage collect.
   ioQ  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
 
@@ -173,15 +171,14 @@ zillowProgram acts = do
           (finaliser:fs) ->  Async.putMVar ioQ fs *> 
                              Async.takeMVar finaliser *> 
                              wait
-
   -- throttle drawing so we don't mash graphs
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
   let go ((action,code):frames) = 
         let 
-          frame        = netT & (Async.writeChan pipe <=< flip tick (action code))
-          printAnswers = Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
-        in  tick forkT (blkIO (frame *>  printAnswers)) : go frames
+          frame        pipe = netT & (Async.writeChan pipe <=< flip tick (action code))
+          printAnswers pipe = Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
+        in  tick forkT (blkIO (Async.newChan >>= \p -> (frame p *> printAnswers p))) : go frames
       go _ =  []
 
   sequence_ (go acts) *> wait
