@@ -39,7 +39,7 @@ type QuandlCode   = Text
 type Page         = Int
 type Log a         = [a]
 
-type ZillowM w b rsc = WriterT (ThreadState rsc w) IO b
+type ZillowM w b = WriterT (ThreadState IO_T w) IO b
 
 data ZCode   = ZCode {
   areaCategory:: AreaCategory
@@ -128,7 +128,7 @@ graph tbl qcode = do
   sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
 
 pg' = pg 0
-pg n zcode = zillow (ZData n zcode)
+pg n zcode = ZData n zcode
 
 apiKey       = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
 ignoreErrors = Control.Exception.handle (\(_::SomeException) -> return ())
@@ -141,7 +141,7 @@ type ThrottleHandle rsc = (Async.QSem,rsc)
 -- the program runs concurrently but the concurrency can be limited
 -- 1 -> sequential execution
 -- n > 1 -> concurrent execution limited to at most n
-throttle :: Int -> rsc -> IO (ThrottleHandle rsc)
+throttle :: Int -> IO_T -> IO (ThrottleHandle IO_T)
 throttle n tag
   | n < 1     = error "throttle. : allocating 0 is fun if you like playing with blocked threads =)"
   | otherwise = Async.newQSem n >>= pure . (,tag)
@@ -158,15 +158,15 @@ tick p job = Control.Exception.bracket_
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
-zillowProgram :: [(t -> IO (Either c ZillowChunk), t)] -> ZillowM (Log (ZillowResponse ZillowChunk)) () rsc
+zillowProgram :: [(t -> IO (Either c ZillowChunk), t)] -> ZillowM (Log (ZillowResponse ZillowChunk)) ()
 zillowProgram ((action,code):frames)= do
   -- list of finalisers we need to garbage collect.
   ioQ  <- liftIO $ Async.newMVar []
 
   -- throttle handles so we can:
-  drawT <- liftIO $ throttle 1 "Draw.IO"    -- draw to screen synchronously
-  netT  <- liftIO $ throttle 2 "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
-  forkT <- liftIO $ throttle 3 "Fork.IO"    -- throttle forking
+  drawT <- liftIO $ throttle 1 DrawIO  -- "Draw.IO"    -- draw to screen synchronously
+  netT  <- liftIO $ throttle 2 NetworkIO -- "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
+  forkT <- liftIO $ throttle 3 ForkIO --"Fork.IO"    -- throttle forking
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do 
@@ -207,58 +207,91 @@ data ThreadState rsc logTyp = ST' {
   ,tsdone :: Bool
   ,tsHandles :: [ThrottleHandle rsc]
   ,tsLogs :: [logTyp]
+  ,tsJobs :: [IO (ZillowResponse ZillowChunk)]
+  ,tsResults :: [ZillowResponse ZillowChunk]
    }
 
 instance Monoid (ThreadState r o) where
-  mempty = ST' False False [] []
-  (ST' li ld lh ll) `mappend` (ST' ri rd rh rl) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl)
+  mempty = ST' False False [] [] [] []
+  (ST' li ld lh ll ljs lr) `mappend` (ST' ri rd rh rl rjs rr) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr)
 
-addLog :: w -> ZillowM w () rsc
+addLog :: w -> ZillowM w ()
 addLog w = pass $ pure ((),(\st@(ST'{..}) -> st { tsLogs= w:tsLogs }))
 
-modify :: (ThreadState rsc LogEntry -> ThreadState rsc LogEntry) -> ZillowM LogEntry () rsc
+modify :: (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
 modify f = pass $ pure ((),f)
 
-start,done :: ZillowM LogEntry () rsc
+update :: IO (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
+update f = do
+  st' <- liftIO f
+  modify (st')
+
+start,done :: ZillowM LogEntry ()
 start = do
   info "Starting ZillowM"
   modify started
     where started st@(ST'{..}) = (st {tsinitialised = True})
+
+initThrottleHandles = do
+  mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(4,ForkIO)]
 
 done = do
   info "Finished ZillowM"
   modify fin
     where fin st@(ST'{..}) = (st {tsdone = True})
 
-info,warn,err :: Text -> ZillowM LogEntry () rsc
+info,warn,err :: Text -> ZillowM LogEntry ()
 info = addLog . Info
 warn = addLog . Warning
 err  = addLog . Main.Error
 
-fork :: IO a -> ZillowM LogEntry () rsc
+fork :: IO a -> ZillowM LogEntry ()
 fork a = do
   warn "Forking"
   liftIO a
   warn "Done Forking"
 
-addRsc :: ThrottleHandle rsc -> ZillowM LogEntry () rsc
+addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
   warn "Registering Throttle Handle"
   modify (\st@(ST'{..}) -> st { tsHandles= h:tsHandles })
+
+addJob :: ZillowR -> IndicatorCode -> ZillowM LogEntry ()
+addJob rq ic = do
+  info ("Scheduling: " <> Data.Text.pack(show ic))
+  modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
+
+runJobs ((x,y):js) = do
+  info ("Fetching: IC:" <> (Data.Text.pack (show y)))
+  res <- liftIO $ zillow x y
+  case res of
+    Left _ -> warn $ "Failed to fetch" <> (Data.Text.pack (show y))
+    _      -> return ()
+  info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
+  modify (\st@(ST'{..}) -> st {tsResults= res:tsResults})
+  runJobs js
+
+runJobs [] = do
+  info "All jobs completed. ZillowM Cleaning up"
+
+runZillowM :: [(ZillowR,IndicatorCode)] -> ZillowM LogEntry [ZillowResponse ZillowChunk]
+runZillowM jobs = do
+  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> done)
+  return tsResults
+
+queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
+testProgram = take 10 $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
+               ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
+               ++ (zip (repeat $ pg' losAngelesCA ) queries) -- pull latest info on LA
+               ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
+               ++ (zip (repeat $ pg' c0 ) queries)
 
 data LogEntry = Warning Text
               | Info Text
               | Error Text deriving Show
 
-test :: WriterT (ThreadState r LogEntry) IO Int
-test = writer (0,mempty) *> start *> fork (print "Hello") *> done *> return (0::Int)
+data IO_T = NetworkIO | ForkIO | DrawIO
 
-execZ = execWriterT 
-
+test = runWriterT $ runZillowM testProgram
 main = do
-  let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
-  execZ $ zillowProgram $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
-               ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
-               ++ (zip (repeat $ pg' losAngelesCA ) queries) -- pull latest info on LA
-               ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
-               ++ (zip (repeat $ pg' c0 ) queries)
+  return ()
