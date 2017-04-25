@@ -1,6 +1,6 @@
 #!/usr/bin/env stack
-{- --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
-{-# LANGUAGE OverloadedStrings,ScopedTypeVariables,TupleSections #-}
+{- --package-mtl-2.2.1 --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
+{-# LANGUAGE RankNTypes,FlexibleInstances,OverloadedStrings,ScopedTypeVariables,TupleSections, FlexibleContexts,MultiParamTypeClasses,RecordWildCards #-}
 module Main where
 import qualified Network.Wreq
 import Data.Vector (Vector)
@@ -31,10 +31,15 @@ import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
 import qualified Debug.Trace        as DT
 
+import Control.Monad.Writer.Lazy as MTL
+
 type AreaCategory = Text
 type AreaCode     = Text
 type QuandlCode   = Text
 type Page         = Int
+type Log a         = [a]
+
+type ZillowM w b rsc = WriterT (ThreadState rsc w) IO b
 
 data ZCode   = ZCode {
   areaCategory:: AreaCategory
@@ -81,6 +86,7 @@ instance Show ZCode where
 data ZillowR = ZData Page ZCode -- A request for information from Zillows db
 
 type ZillowResponse b = Either Error b
+type ZillowChunk = (QuandlCode,LBS.ByteString)
 type Error = Text
 
 -- emptyZCode :: Initialise a zillow code using area category and code
@@ -93,7 +99,9 @@ edgewaterFL   = emptyZCode "N" "00487"
 brickellFL    = emptyZCode "N" "00332" 
 losAngelesCA  = emptyZCode "N" "00014" 
 
-zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse (QuandlCode,LBS.ByteString))
+
+
+zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse ZillowChunk)
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
                               `Control.Exception.catch`  --catch exceptions.
                               (\(_::SomeException) -> return (DT.trace (Data.Text.unpack $ "Zillow Err: " <> qcode) $ Left ("Zillow Err: " <> qcode)))
@@ -128,6 +136,7 @@ quietly      = ignoreErrors
 
 type ThrottleHandle rsc = (Async.QSem,rsc)
 
+
 -- create n resource handles.
 -- the program runs concurrently but the concurrency can be limited
 -- 1 -> sequential execution
@@ -136,6 +145,7 @@ throttle :: Int -> rsc -> IO (ThrottleHandle rsc)
 throttle n tag
   | n < 1     = error "throttle. : allocating 0 is fun if you like playing with blocked threads =)"
   | otherwise = Async.newQSem n >>= pure . (,tag)
+
 
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
@@ -148,14 +158,15 @@ tick p job = Control.Exception.bracket_
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
-zillowProgram acts = do
+zillowProgram :: [(t -> IO (Either c ZillowChunk), t)] -> ZillowM (Log (ZillowResponse ZillowChunk)) () rsc
+zillowProgram ((action,code):frames)= do
   -- list of finalisers we need to garbage collect.
-  ioQ  <- Async.newMVar [] :: IO (Async.MVar [Async.MVar ()])
+  ioQ  <- liftIO $ Async.newMVar []
 
   -- throttle handles so we can:
-  netT  <- throttle 2 "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
-  drawT <- throttle 1 "Draw.IO"    -- draw to screen synchronously
-  forkT <- throttle 2 "Fork.IO"    -- throttle forking
+  drawT <- liftIO $ throttle 1 "Draw.IO"    -- draw to screen synchronously
+  netT  <- liftIO $ throttle 2 "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
+  forkT <- liftIO $ throttle 3 "Fork.IO"    -- throttle forking
 
   -- Copied from: [1] - just formatted to my preference
   let blkIO io = do 
@@ -174,19 +185,79 @@ zillowProgram acts = do
   -- throttle drawing so we don't mash graphs
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
-  let go ((action,code):frames) = 
+  let go (action,code) = 
         let 
           frame        pipe = netT & (Async.writeChan pipe <=< flip tick (action code))
           printAnswers pipe = Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
-        in  tick forkT (blkIO (Async.newChan >>= \p -> (frame p *> printAnswers p))) : go frames
-      go _ =  []
-
-  sequence_ (go acts) *> wait
+          log          pipe = do
+            (zillowPayload, state) <- listen (liftIO (Async.readChan  pipe))
+            let log' = (zillowPayload:state)
+            writer ((),log')
+        in (do{c <- liftIO Async.newChan
+               ;liftIO (tick forkT (blkIO ((frame c *> printAnswers c)))) *> log c
+               })
+  
+  (x,l) <- listen $ liftIO (action code)
+  tell l
+--  sequentraverse go acts <* liftIO wait
   --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
+
+data ThreadState rsc logTyp = ST' {
+  tsinitialised :: Bool
+  ,tsdone :: Bool
+  ,tsHandles :: [ThrottleHandle rsc]
+  ,tsLogs :: [logTyp]
+   }
+
+instance Monoid (ThreadState r o) where
+  mempty = ST' False False [] []
+  (ST' li ld lh ll) `mappend` (ST' ri rd rh rl) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl)
+
+addLog :: w -> ZillowM w () rsc
+addLog w = pass $ pure ((),(\st@(ST'{..}) -> st { tsLogs= w:tsLogs }))
+
+modify :: (ThreadState rsc LogEntry -> ThreadState rsc LogEntry) -> ZillowM LogEntry () rsc
+modify f = pass $ pure ((),f)
+
+start,done :: ZillowM LogEntry () rsc
+start = do
+  info "Starting ZillowM"
+  modify started
+    where started st@(ST'{..}) = (st {tsinitialised = True})
+
+done = do
+  info "Finished ZillowM"
+  modify fin
+    where fin st@(ST'{..}) = (st {tsdone = True})
+
+info,warn,err :: Text -> ZillowM LogEntry () rsc
+info = addLog . Info
+warn = addLog . Warning
+err  = addLog . Main.Error
+
+fork :: IO a -> ZillowM LogEntry () rsc
+fork a = do
+  warn "Forking"
+  liftIO a
+  warn "Done Forking"
+
+addRsc :: ThrottleHandle rsc -> ZillowM LogEntry () rsc
+addRsc h = do
+  warn "Registering Throttle Handle"
+  modify (\st@(ST'{..}) -> st { tsHandles= h:tsHandles })
+
+data LogEntry = Warning Text
+              | Info Text
+              | Error Text deriving Show
+
+test :: WriterT (ThreadState r LogEntry) IO Int
+test = writer (0,mempty) *> start *> fork (print "Hello") *> done *> return (0::Int)
+
+execZ = execWriterT 
 
 main = do
   let queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
-  zillowProgram $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
+  execZ $ zillowProgram $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
                ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
                ++ (zip (repeat $ pg' losAngelesCA ) queries) -- pull latest info on LA
                ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
