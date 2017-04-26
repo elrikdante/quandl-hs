@@ -120,7 +120,7 @@ graph tbl qcode = do
       _ = rows :: Value
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
-      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data, bar: true).draw)'") 
+      ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(18), bar: true).draw)'") 
       -- this runs much faster if bundle exec is removed from here,
       -- but ascii_charts will need to be installed on system gems as well.
       -- gem install ascii_charts
