@@ -106,7 +106,7 @@ losAngelesCA  = emptyZCode "N" "00014"
 zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse ZillowChunk)
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
                               `Control.Exception.catch`  --catch exceptions.
-                              (\(_::SomeException) -> return (DT.trace (Data.Text.unpack $ "Zillow Err: " <> qcode) $ Left ("Zillow Err: " <> qcode)))
+                              (\(_::SomeException) -> return (Left ("Zillow Err: " <> qcode)))
   where
     qcode = quandlCode code ic
     url = "https://www.quandl.com/api/v3/datasets/" ++ Data.Text.unpack(qcode) ++ ".json?" ++ "page=" ++ (show page) ++ "&api_key=" ++ apiKey
@@ -232,6 +232,7 @@ runZillowM :: [(ZillowR,IndicatorCode)] -> ZillowM LogEntry [ZillowResponse Zill
 runZillowM jobs = do
   when (null jobs) (error "runZillowM: Nothing to do")
   drawT : netT : forkT : [] <- initThrottleHandles
+  liftIO $ IO.hSetBuffering IO.stdout IO.NoBuffering
   info "Intialising Finalisers"
   finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
   chan <- liftIO $ Async.newChan
@@ -246,27 +247,25 @@ runZillowM jobs = do
   info ("Beginning graph rendering")
   info ("Waiting on Asyncs to terminate")
   (ioLogF,ioLogG) <- Turtle.liftA2 (,) (liftIO $ drawGraphs jobsQueued drawT chan id) (liftIO $ waitIO finalisers id 0)
-  info ("Backfilling IO Logs")
   flip mapM (Data.List.sortOn fst (ioLogG++ioLogF)) (\(t,l) -> addLogWithPrefix l (pure t))
-  info ("Done")
+  info ("Backfilled IO Logs")
   done
   return tsResults
     where
       drawGraphs 0 _  _  log = return (log [])
       drawGraphs n dt ch log = do
         lg0 <- quickLog ("Graphing" <> Data.Text.pack (show n))
-        print n
         tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) )
         lg1 <- quickLog ("Done Graphing" <> Data.Text.pack (show n))
         drawGraphs (pred n) dt ch (log . (lg1:) . (lg0:))
-      {-# NOINLINE drawGraphs #-}
+      {-# INLINE drawGraphs #-}
 
       blkIO ioQ fT t action = do
         -- Copied from: [1] - just formatted to my preference
         fs@(f:_) <- liftM2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
         Async.putMVar ioQ fs
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
-      {-# NOINLINE blkIO #-}
+      {-# INLINE blkIO #-}
 
       quickLog = liftM2 (,) IO.getCurrentTime . return . IOLog
 
@@ -279,7 +278,7 @@ runZillowM jobs = do
           (f:fs) -> Async.putMVar ioQ fs *>
                     Async.takeMVar f *>
                     waitIO ioQ (log . (ql1:) . (ql0:)) (succ c)
-      {-# NOINLINE waitIO #-}
+      {-# INLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
 testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
