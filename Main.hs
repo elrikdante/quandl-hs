@@ -299,7 +299,7 @@ instance TextLike LogEntry where
 
 data IO_T = NetworkIO | ForkIO | DrawIO deriving (Eq,Ord,Enum)
 
-test = runWriterT $ runZillowM (take 10 testProgram)
+test = runWriterT $ runZillowM testProgram
 main = do
   (_,ST'{..}) <- test
   mapM print tsLogs
