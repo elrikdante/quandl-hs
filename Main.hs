@@ -16,6 +16,7 @@ import Data.Function ((&))
 import Control.Lens((^.),_Right,view,over)
 import Control.Exception(catch,SomeException,bracket_,finally,handle)
 import Data.Aeson
+import Data.List(sortOn)
 import Data.Maybe(mapMaybe,fromJust)
 import Control.Monad
 import Data.Aeson.Types
@@ -161,13 +162,15 @@ instance Monoid (ThreadState r o) where
   (ST' li ld lh ll ljs lr) `mappend` (ST' ri rd rh rl rjs rr) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr)
 
 addLog :: (Monoid w,TextLike w) => w -> ZillowM w ()
-addLog w = liftIO (IO.getCurrentTime                  >>= 
+addLog w = addLogWithPrefix w IO.getCurrentTime
+
+addLogWithPrefix :: (Monoid w,TextLike w) => w -> IO IO.UTCTime ->  ZillowM w ()
+addLogWithPrefix w pf = liftIO (pf >>=
            pure 
            . Data.Text.pack 
            . IO.formatTime IO.defaultTimeLocale "[%s%Q] ") >>= \prefix 
            -> pass $ pure ((),(\st@(ST'{..}) 
            -> st { tsLogs=toText (prefix<>) w : tsLogs }))
-
 modify :: (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
 modify f = pass $ pure ((),f)
 
@@ -198,12 +201,10 @@ done = do
   info "Finished ZillowM"
     where fin st@(ST'{..}) = (st {tsdone = True})
 
-info,warn,err :: Text -> ZillowM LogEntry ()
+info,iolog,err :: Text -> ZillowM LogEntry ()
 info = addLog . Info
-warn = addLog . Warning
+iolog = addLog . IOLog
 err  = addLog . Main.Error
-
-fork action= warn "Forking" *> action <*  warn "Done Forking"
 
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
@@ -213,9 +214,10 @@ tick p job =Control.Exception.bracket_
             (Async.waitQSem (fst p))
             (Async.signalQSem (fst p))
             job
+
 addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
-  warn "Registering Throttle Handle"
+  iolog "Registering Throttle Handle"
   modify (\st@(ST'{..}) -> st { tsHandles= h:tsHandles })
 
 addJob :: ZillowR -> IndicatorCode -> ZillowM LogEntry ()
@@ -242,33 +244,41 @@ runZillowM jobs = do
 
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
-  liftIO $ drawGraphs jobsQueued drawT chan
   info ("Waiting on Asyncs to terminate")
-  ioLog <- liftIO $ waitIO finalisers (const []) 0
+  (ioLogF,ioLogG) <- Turtle.liftA2 (,) (liftIO $ drawGraphs jobsQueued drawT chan id) (liftIO $ waitIO finalisers id 0)
   info ("Backfilling IO Logs")
-  mapM addLog ioLog
+  flip mapM (Data.List.sortOn fst (ioLogG++ioLogF)) (\(t,l) -> addLogWithPrefix l (pure t))
   info ("Done")
   done
   return tsResults
     where
-      drawGraphs 0 _  _  = return ()
-      drawGraphs n dt ch = print n *> tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) ) *> drawGraphs (pred n) dt ch
+      drawGraphs 0 _  _  log = return (log [])
+      drawGraphs n dt ch log = do
+        lg0 <- quickLog ("Graphing" <> Data.Text.pack (show n))
+        print n
+        tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) )
+        lg1 <- quickLog ("Done Graphing" <> Data.Text.pack (show n))
+        drawGraphs (pred n) dt ch (log . (lg1:) . (lg0:))
       {-# NOINLINE drawGraphs #-}
+
       blkIO ioQ fT t action = do
         -- Copied from: [1] - just formatted to my preference
         fs@(f:_) <- liftM2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
         Async.putMVar ioQ fs
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
       {-# NOINLINE blkIO #-}
+
+      quickLog = liftM2 (,) IO.getCurrentTime . return . IOLog
+
       waitIO ioQ log c = do
-        la <- return (Info $ "Waiting on finaliser" <> (Data.Text.pack (show c)))
+        ql0 <- quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c)))
         q <- Async.takeMVar ioQ
-        lb <- return (Info $ "Done on finaliser" <> (Data.Text.pack (show c)))
+        ql1 <- quickLog ("Done on finaliser" <> (Data.Text.pack (show c)))
         case q of
           [] -> return (log []) -- extract difference list
           (f:fs) -> Async.putMVar ioQ fs *>
                     Async.takeMVar f *>
-                    waitIO ioQ ((lb:) . (la:) . log) (succ c)
+                    waitIO ioQ (log . (ql1:) . (ql0:)) (succ c)
       {-# NOINLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
@@ -278,13 +288,13 @@ testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on 
                ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
                ++ (zip (repeat $ pg' c0 ) queries)
 
-data LogEntry = Warning Text
+data LogEntry = IOLog Text
               | Info Text
-              | Error Text deriving Show
+              | Error Text deriving (Show,Ord,Eq)
 
 instance Monoid LogEntry where
   mempty = Main.Error mempty -- :)
-  Warning l `mappend` Warning r = Warning (l <> r)
+  IOLog l `mappend` IOLog r = IOLog (l <> r)
   Info l `mappend` Info r = Info (l <> r)
   Main.Error l `mappend` Main.Error r = Main.Error (l <> r)
 
@@ -292,14 +302,14 @@ class TextLike a where
   toText :: (Text -> Text) -> a -> a
 
 instance TextLike LogEntry where
-  toText f (Warning t) = Warning (f t)
+  toText f (IOLog t) = IOLog (f t)
   toText f (Main.Error t) = Main.Error (f t)
   toText f (Info t) = Info (f t)
 
 
 data IO_T = NetworkIO | ForkIO | DrawIO deriving (Eq,Ord,Enum)
 
-test = runWriterT $ runZillowM (take 10 testProgram)
+test = runWriterT $ runZillowM testProgram
 main = do
   (_,ST'{..}) <- test
   mapM print tsLogs
