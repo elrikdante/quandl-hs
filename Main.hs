@@ -145,56 +145,6 @@ throttle n tag
   | n < 1     = error "throttle. : allocating 0 is fun if you like playing with blocked threads =)"
   | otherwise = Async.newQSem n >>= pure . (,tag)
 
-
-
--- run a set of queries againsts Zillow's Quandl Database.
--- each query will be printed as an ascii_graph
--- some queries may fail, there is no retry.
-zillowProgram :: [(t -> IO (Either c ZillowChunk), t)] -> ZillowM (Log (ZillowResponse ZillowChunk)) ()
-zillowProgram ((action,code):frames)= do
-  -- list of finalisers we need to garbage collect.
-  ioQ  <- liftIO $ Async.newMVar []
-
-  -- throttle handles so we can:
-  drawT <- liftIO $ throttle 1 DrawIO  -- "Draw.IO"    -- draw to screen synchronously
-  netT  <- liftIO $ throttle 2 NetworkIO -- "Network.IO" -- fetch network concurrently  - don't hammer quandl (rate-limit)
-  forkT <- liftIO $ throttle 3 ForkIO --"Fork.IO"    -- throttle forking
-
-  -- Copied from: [1] - just formatted to my preference
-  let blkIO io = do 
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> return q <* Async.putMVar ioQ q)
-        Async.forkIO (quietly io `finally` Async.putMVar finaliser ())
- 
-  -- writing the last bind (Async.putMVar ioQ *> return) in point free results in : 
-  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
-  let wait = do
-        q <- Async.takeMVar ioQ
-        case q of
-          []             -> return () -- done waiting
-          (finaliser:fs) ->  Async.putMVar ioQ fs *> 
-                             Async.takeMVar finaliser *> 
-                             wait
-  -- throttle drawing so we don't mash graphs
-  -- throttle forking because we don't want to spike memory
-  -- throttle network too as quandl's API doesn't like being hammered
-{-  let go (action,code) = 
-        let 
-          frame        pipe = netT & (Async.writeChan pipe <=< flip tick (action code))
-          printAnswers pipe = Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
-          log          pipe = do
-            (zillowPayload, state) <- listen (liftIO (Async.readChan  pipe))
-            let log' = (zillowPayload:state)
-            writer ((),log')
-        in (do{c <- liftIO Async.newChan
-               ;liftIO (tick forkT (blkIO ((frame c *> printAnswers c)))) *> log c
-               })
--}
-  let go = undefined
-  (x,l) <- listen $ liftIO (action code)
-  tell l
---  sequentraverse go acts <* liftIO wait
-  --[1]see: https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
-
 data ThreadState rsc logTyp = ST' {
   tsinitialised :: Bool
   ,tsdone :: Bool
@@ -243,37 +193,14 @@ info = addLog . Info
 warn = addLog . Warning
 err  = addLog . Main.Error
 
-fork :: Async.MVar [Async.MVar ()] -> [ThrottleHandle IO_T] -> ZillowM LogEntry (ZillowResponse ZillowChunk) -> ZillowM LogEntry (Async.MVar ())
-fork ioQ ths a = do
+fork :: [ThrottleHandle IO_T] -> ZillowM LogEntry (ZillowResponse ZillowChunk) -> ZillowM LogEntry (ZillowResponse ZillowChunk)
+fork ths action= do
   warn "Forking"
-  liftIO (print "FF")
-  (finaliser:_) <- liftM2 (:) (liftIO Async.newEmptyMVar) (liftIO (Async.takeMVar ioQ)) >>= (\q -> liftIO (return q) <* liftIO (Async.putMVar ioQ q))
-  chan <- liftIO (Async.newChan)
-  let drawT : netT : forkT : [] = ths
---      _ = ioQ' :: a
-  tick forkT $
-    tick netT $ do
-      fork ioQ ths $ do
-        (res,st) <- liftIO (Async.readChan chan)
-        liftIO $ print "HI"
---        info "Graphing"
---        tick drawT (liftIO (uncurry (flip graph) . (^. _Right) $  g))
---        info "Done Graphing"
-        return res
-      liftIO $ Async.forkIO (runWriterT a >>= Async.writeChan chan)
-{-    tick forkT (do
-                   r <- tick netT (liftIO a)
-                   info "Graphing" *> tick drawT (liftIO (uncurry (flip graph) . (^. _Right) $  r)) <* info "Done Graphing"
-                   return r
-               )
--}
+--  let drawT : netT : forkT : [] = ths
+  res <- action
   warn "Done Forking"
-  return finaliser
+  liftIO (uncurry (flip graph) . (^. _Right) $ res) *> return res
 
-{-  let blkIO io = do 
-        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> return q <* Async.putMVar ioQ q)
-        Async.forkIO (quietly io `finally` Async.putMVar finaliser ())
--}
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
 -- without this type sig we get skolem type variable errs. :s
@@ -296,7 +223,6 @@ tick p job = do
   return r
   where
     (_, rsc) = p
-    _ = p  :: ThrottleHandle IO_T
 
 addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
@@ -309,30 +235,25 @@ addJob rq ic = do
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
 
 runJobs ioQ ths ((x,y):js) = do
-  liftIO (print "RJ")
   info ("Fetching: IC:" <> (Data.Text.pack (show y)))
-  finaliser <- fork ioQ ths (liftIO (zillow x y))
-  ioQ' <- liftIO (Async.takeMVar ioQ >>= \q ->  Async.putMVar ioQ (finaliser:q) *> return ioQ)
-  liftIO (print "RJ2")
-  res <- return $ Left ""
+  res <- fork ths (liftIO (zillow x y))
   case res of
     Left _ -> warn $ "Failed to fetch" <> (Data.Text.pack (show y))
-    _      -> do
-      info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
+    _      -> info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
   modify (\st@(ST'{..}) -> st {tsResults= res:tsResults})
-  runJobs ioQ' ths js
+  runJobs ioQ ths js
 
 
-runJobs _ _ [] = liftIO (print "WAIT") *> gets
+runJobs _ _ [] = return ()
 
 runZillowM :: [(ZillowR,IndicatorCode)] -> ZillowM LogEntry [ZillowResponse ZillowChunk]
 runZillowM jobs = do
   when (null jobs) (error "runZillowM: Nothing to do")
   ths <- initThrottleHandles
   info "Intialising Finalisers"
-  finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
+--  finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
   info "Running Jobs"
-  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> runJobs finalisers ths jobs *> done)
+  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> runJobs undefined ths jobs *> done)
   return tsResults
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
