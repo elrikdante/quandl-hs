@@ -165,7 +165,7 @@ addLog :: (Monoid w,TextLike w) => w -> ZillowM w ()
 addLog w = addLogWithPrefix w IO.getCurrentTime
 
 addLogWithPrefix :: (Monoid w,TextLike w) => w -> IO IO.UTCTime ->  ZillowM w ()
-addLogWithPrefix w pf = liftIO (pf >>=
+addLogWithPrefix w pf = liftIO (pf                         >>=
            pure 
            . Data.Text.pack 
            . IO.formatTime IO.defaultTimeLocale "[%s%Q] ") >>= \prefix 
@@ -238,7 +238,7 @@ runZillowM jobs = do
   info "Scheduling Jobs"
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
   info "Processing Started"
-  jobsQueued <- liftIO $ do
+  jobsQueued   <- liftIO $ do
     flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
     length <$> Async.readMVar finalisers
 
@@ -272,7 +272,7 @@ runZillowM jobs = do
 
       waitIO ioQ log c = do
         ql0 <- quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c)))
-        q <- Async.takeMVar ioQ
+        q   <- Async.takeMVar ioQ
         ql1 <- quickLog ("Done on finaliser" <> (Data.Text.pack (show c)))
         case q of
           [] -> return (log []) -- extract difference list
