@@ -14,6 +14,7 @@ import qualified Data.Text.Encoding as LData.Text
 import qualified Data.Text.Lazy     as LData.Text
 import Data.Function ((&))
 import Control.Lens((^.),_Right,view,over)
+import Control.Applicative(liftA3,liftA2)
 import Control.Exception(catch,SomeException,bracket_,finally,handle)
 import Data.Aeson
 import Data.List(sortOn)
@@ -120,6 +121,7 @@ graph tbl qcode = do
                                                                                 ,"data" .= Null])
                                                         in mapMaybe (flip HM.lookup recs) ["name","description","data"]
       _ = rows :: Value
+  l0 <- quickLog "Start Graph.Draw"
   (Turtle.ExitSuccess, asciiGraph) <- 
     Turtle.shellStrict 
       ("bundle exec ruby -r ascii_charts -r json -e 'data=JSON(STDIN.read.chomp) rescue [] and data.any? && STDOUT.puts(AsciiCharts::Cartesian.new(data.first(18), bar: true).draw)'") 
@@ -127,7 +129,9 @@ graph tbl qcode = do
       -- but ascii_charts will need to be installed on system gems as well.
       -- gem install ascii_charts
       (return $ LData.Text.decodeUtf8 (LBS.toStrict (encode rows)))
-  sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph]
+  (sequence_ $ (fmap Data.Text.putStrLn) [qcode,name,description,asciiGraph])
+  l1 <- quickLog "End Graph.Draw"
+  return ((l0:). (l1:))
 
 pg' = pg 0
 pg n zcode = ZData n zcode
@@ -135,6 +139,9 @@ pg n zcode = ZData n zcode
 apiKey       = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl supports github login: https://www.quandl.com/search?query=
 ignoreErrors = Control.Exception.handle (\(_::SomeException) -> return ())
 quietly      = ignoreErrors
+
+quickLog = liftA2 (,) IO.getCurrentTime . pure . IOLog
+{-# INLINE quickLog #-}
 
 type ThrottleHandle rsc = (Async.QSem,rsc)
 
@@ -163,7 +170,7 @@ instance Monoid (ThreadState r o) where
 
 addLog :: (Monoid w,TextLike w) => w -> ZillowM w ()
 addLog w = addLogWithPrefix w IO.getCurrentTime
-
+{-# INLINE addLog #-}
 addLogWithPrefix :: (Monoid w,TextLike w) => w -> IO IO.UTCTime ->  ZillowM w ()
 addLogWithPrefix w pf = liftIO (pf                         >>=
            pure 
@@ -171,8 +178,10 @@ addLogWithPrefix w pf = liftIO (pf                         >>=
            . IO.formatTime IO.defaultTimeLocale "[%s%Q] ") >>= \prefix 
            -> pass $ pure ((),(\st@(ST'{..}) 
            -> st { tsLogs=toText (prefix<>) w : tsLogs }))
+{-# INLINE addLogWithPrefix #-}
 modify :: (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
 modify f = pass $ pure ((),f)
+{-# INLINE modify #-}
 
 gets :: ZillowM w (ThreadState IO_T w)
 gets = do
@@ -214,6 +223,7 @@ tick p job =Control.Exception.bracket_
             (Async.waitQSem (fst p))
             (Async.signalQSem (fst p))
             job
+{-# INLINE tick #-}
 
 addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
@@ -246,38 +256,39 @@ runZillowM jobs = do
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
   info ("Waiting on Asyncs to terminate")
-  (ioLogF,ioLogG) <- Turtle.liftA2 (,) (liftIO $ drawGraphs jobsQueued drawT chan id) (liftIO $ waitIO finalisers id 0)
-  flip mapM (Data.List.sortOn fst (ioLogG++ioLogF)) (\(t,l) -> addLogWithPrefix l (pure t))
+  (ioLogG,ioLogF) <- Turtle.liftA2 (,) (liftIO $ drawGraphs jobsQueued drawT chan id) (liftIO $ waitIO finalisers id 0)
   info ("Backfilled IO Logs")
   done
+  ((),ST'{..}) <- listen (sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG)))
   return tsResults
     where
-      drawGraphs 0 _  _  log = return (log [])
+      drawGraphs 0 _  _  log = pure (log [])
       drawGraphs n dt ch log = do
-        lg0 <- quickLog ("Graphing" <> Data.Text.pack (show n))
-        tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) )
-        lg1 <- quickLog ("Done Graphing" <> Data.Text.pack (show n))
-        drawGraphs (pred n) dt ch (log . (lg1:) . (lg0:))
+        (lg0,r,lg1) <- liftA3 (,,)
+                        (quickLog ("Graphing" <> Data.Text.pack (show n)))
+                        (tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) ))
+                        (quickLog ("Done Graphing" <> Data.Text.pack (show n)))
+        drawGraphs (pred n) dt ch (log . (lg0:) . r . (lg1:))
       {-# INLINE drawGraphs #-}
 
       blkIO ioQ fT t action = do
         -- Copied from: [1] - just formatted to my preference
-        fs@(f:_) <- liftM2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
+        fs@(f:_) <- liftA2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
         Async.putMVar ioQ fs
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
       {-# INLINE blkIO #-}
 
-      quickLog = liftM2 (,) IO.getCurrentTime . return . IOLog
 
       waitIO ioQ log c = do
-        ql0 <- quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c)))
-        q   <- Async.takeMVar ioQ
-        ql1 <- quickLog ("Done on finaliser" <> (Data.Text.pack (show c)))
+        (ql0,q,ql1) <- liftA3 (,,) 
+                       (quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c))))
+                       (Async.takeMVar ioQ)
+                       (quickLog ("Done on finaliser" <> (Data.Text.pack (show c))))
         case q of
           [] -> return (log []) -- extract difference list
           (f:fs) -> Async.putMVar ioQ fs *>
                     Async.takeMVar f *>
-                    waitIO ioQ (log . (ql1:) . (ql0:)) (succ c)
+                    waitIO ioQ (log . (ql0:) . (ql1:)) (succ c)
       {-# INLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
@@ -300,11 +311,13 @@ instance Monoid LogEntry where
 class TextLike a where 
   toText :: (Text -> Text) -> a -> a
 
+
+
 instance TextLike LogEntry where
   toText f (IOLog t) = IOLog (f t)
   toText f (Main.Error t) = Main.Error (f t)
   toText f (Info t) = Info (f t)
-
+  {-# INLINE toText #-}
 
 data IO_T = NetworkIO | ForkIO | DrawIO deriving (Eq,Ord,Enum)
 
