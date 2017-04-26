@@ -166,7 +166,7 @@ modify f = pass $ pure ((),f)
 
 gets :: ZillowM w (ThreadState IO_T w)
 gets = do
-  ((),st) <- listen (pure ())
+  (r,st) <- listen (pure ())
   tell st
   return st
 
@@ -193,36 +193,23 @@ info = addLog . Info
 warn = addLog . Warning
 err  = addLog . Main.Error
 
-fork :: [ThrottleHandle IO_T] -> ZillowM LogEntry (ZillowResponse ZillowChunk) -> ZillowM LogEntry (ZillowResponse ZillowChunk)
-fork ths action= do
+fork action= do
   warn "Forking"
---  let drawT : netT : forkT : [] = ths
   res <- action
   warn "Done Forking"
-  liftIO (uncurry (flip graph) . (^. _Right) $ res) *> return res
+  return res
 
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
 -- without this type sig we get skolem type variable errs. :s
-tick :: ThrottleHandle IO_T -> ZillowM LogEntry a -> ZillowM LogEntry a
+tick :: ThrottleHandle IO_T -> IO a -> IO a
 tick p job = do
-
-  when (rsc == ForkIO) (info "Acquiring Fork Lock")
-  when (rsc == NetworkIO) (info "Acquiring Net Lock")
-  when (rsc == DrawIO) (info "Acquiring Draw Lock")
-
-  (r,st') <- liftIO $ Control.Exception.bracket_
-             (Async.waitQSem (fst p))
-             (Async.signalQSem (fst p))
-             (runWriterT job)
-  tell st'
-  when (rsc == ForkIO) (info "Releasing Fork Lock")
-  when (rsc == NetworkIO) (info "Releasing Net Lock")
-  when (rsc == DrawIO) (info "Releasing Draw Lock")
-
+  r <- Control.Exception.bracket_
+       (Async.waitQSem (fst p))
+       (Async.signalQSem (fst p))
+       job
   return r
-  where
-    (_, rsc) = p
+
 
 addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
@@ -234,27 +221,59 @@ addJob rq ic = do
   info ("Scheduling: " <> Data.Text.pack(show ic))
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
 
-runJobs ioQ ths ((x,y):js) = do
+runJobs ((x,y):js) = do
   info ("Fetching: IC:" <> (Data.Text.pack (show y)))
-  res <- fork ths (liftIO (zillow x y))
+  res <- fork (liftIO (zillow x y))
   case res of
     Left _ -> warn $ "Failed to fetch" <> (Data.Text.pack (show y))
     _      -> info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
   modify (\st@(ST'{..}) -> st {tsResults= res:tsResults})
-  runJobs ioQ ths js
+  runJobs js
 
 
-runJobs _ _ [] = return ()
+runJobs [] = do
+  ST'{..} <- gets
+  liftIO (print tsLogs)
+  return ()
 
 runZillowM :: [(ZillowR,IndicatorCode)] -> ZillowM LogEntry [ZillowResponse ZillowChunk]
 runZillowM jobs = do
   when (null jobs) (error "runZillowM: Nothing to do")
-  ths <- initThrottleHandles
+  drawT : netT : forkT : [] <- initThrottleHandles
   info "Intialising Finalisers"
---  finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
-  info "Running Jobs"
-  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> runJobs undefined ths jobs *> done)
+  finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
+  chan <- liftIO $ Async.newChan
+  info "Scheduling Jobs"
+  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> done)
+  info "Processing Started"
+  jobsQueued <- liftIO $ do
+    flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
+    length <$> Async.readMVar finalisers
+
+  info ("Queued: " <> Data.Text.pack (show jobsQueued))
+  info ("Beginning graph rendering")
+  liftIO $ drawGraphs jobsQueued drawT chan
+  info ("Waiting on Asyncs to terminate")
+  liftIO $ waitIO finalisers undefined
+  info ("Done")
   return tsResults
+    where
+      drawGraphs 0 _  _  = return ()
+      drawGraphs n dt ch = print n *> tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) ) *> drawGraphs (pred n) dt ch
+      {-# NOINLINE drawGraphs #-}
+      blkIO ioQ fT t action = do
+        fs@(f:_) <- liftM2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
+        Async.putMVar ioQ fs
+        tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
+      {-# NOINLINE blkIO #-}
+      waitIO ioQ log = do
+        q <- Async.takeMVar ioQ
+        case q of
+          [] -> return ()
+          (f:fs) -> Async.putMVar ioQ fs *>
+                    Async.takeMVar f *>
+                    waitIO ioQ log
+      {-# NOINLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
 testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
