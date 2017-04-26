@@ -29,8 +29,9 @@ import Turtle((<=<),(<|>))
 import qualified System.Environment as IO
 import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
+import qualified Data.Time.Clock    as IO
+import qualified Data.Time.Format   as IO
 import qualified Debug.Trace        as DT
-
 import Control.Monad.Writer.Lazy as MTL
 
 type AreaCategory = Text
@@ -154,12 +155,18 @@ data ThreadState rsc logTyp = ST' {
   ,tsResults :: [ZillowResponse ZillowChunk]
    }
 
+  
 instance Monoid (ThreadState r o) where
   mempty = ST' False False [] [] [] []
   (ST' li ld lh ll ljs lr) `mappend` (ST' ri rd rh rl rjs rr) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr)
 
-addLog :: w -> ZillowM w ()
-addLog w = pass $ pure ((),(\st@(ST'{..}) -> st { tsLogs= w:tsLogs }))
+addLog :: (Monoid w,TextLike w) => w -> ZillowM w ()
+addLog w = liftIO (IO.getCurrentTime                  >>= 
+           pure 
+           . Data.Text.pack 
+           . IO.formatTime IO.defaultTimeLocale "[%s%Q] ") >>= \prefix 
+           -> pass $ pure ((),(\st@(ST'{..}) 
+           -> st { tsLogs=toText (prefix<>) w : tsLogs }))
 
 modify :: (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
 modify f = pass $ pure ((),f)
@@ -177,15 +184,18 @@ start = do
   where started st@(ST'{..}) = (st {tsinitialised = True})
 
 initThrottleHandles = do
+  -- throttle drawing so we don't mash graphs
+  -- throttle forking because we don't want to spike memory
+  -- throttle network too as quandl's API doesn't like being hammered
   info "Initialising Throttle Handles"
-  ths <- liftIO (mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(7,ForkIO)])
+  ths <- liftIO (mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(8,ForkIO)])
   info "Initialised Throttle Handles"
   return ths
 
 done = do
   info "All jobs completed. ZillowM Cleaning up"
-  info "Finished ZillowM"
   modify fin
+  info "Finished ZillowM"
     where fin st@(ST'{..}) = (st {tsdone = True})
 
 info,warn,err :: Text -> ZillowM LogEntry ()
@@ -193,24 +203,16 @@ info = addLog . Info
 warn = addLog . Warning
 err  = addLog . Main.Error
 
-fork action= do
-  warn "Forking"
-  res <- action
-  warn "Done Forking"
-  return res
+fork action= warn "Forking" *> action <*  warn "Done Forking"
 
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
 -- without this type sig we get skolem type variable errs. :s
 tick :: ThrottleHandle IO_T -> IO a -> IO a
-tick p job = do
-  r <- Control.Exception.bracket_
-       (Async.waitQSem (fst p))
-       (Async.signalQSem (fst p))
-       job
-  return r
-
-
+tick p job =Control.Exception.bracket_
+            (Async.waitQSem (fst p))
+            (Async.signalQSem (fst p))
+            job
 addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
   warn "Registering Throttle Handle"
@@ -220,21 +222,9 @@ addJob :: ZillowR -> IndicatorCode -> ZillowM LogEntry ()
 addJob rq ic = do
   info ("Scheduling: " <> Data.Text.pack(show ic))
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
-
-runJobs ((x,y):js) = do
-  info ("Fetching: IC:" <> (Data.Text.pack (show y)))
-  res <- fork (liftIO (zillow x y))
-  case res of
-    Left _ -> warn $ "Failed to fetch" <> (Data.Text.pack (show y))
-    _      -> info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
-  modify (\st@(ST'{..}) -> st {tsResults= res:tsResults})
-  runJobs js
-
-
-runJobs [] = do
-  ST'{..} <- gets
-  liftIO (print tsLogs)
-  return ()
+-- run a set of queries againsts Zillow's Quandl Database.
+-- each query will be printed as an ascii_graph
+-- some queries may fail, there is no retry.
 
 runZillowM :: [(ZillowR,IndicatorCode)] -> ZillowM LogEntry [ZillowResponse ZillowChunk]
 runZillowM jobs = do
@@ -265,6 +255,7 @@ runZillowM jobs = do
       drawGraphs n dt ch = print n *> tick dt (Async.readChan ch >>= uncurry (flip graph) . (^. _Right) ) *> drawGraphs (pred n) dt ch
       {-# NOINLINE drawGraphs #-}
       blkIO ioQ fT t action = do
+        -- Copied from: [1] - just formatted to my preference
         fs@(f:_) <- liftM2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
         Async.putMVar ioQ fs
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
@@ -277,7 +268,7 @@ runZillowM jobs = do
           [] -> return (log []) -- extract difference list
           (f:fs) -> Async.putMVar ioQ fs *>
                     Async.takeMVar f *>
-                    waitIO ioQ ((lb:). (la:) . log) (succ c)
+                    waitIO ioQ ((lb:) . (la:) . log) (succ c)
       {-# NOINLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
@@ -291,9 +282,26 @@ data LogEntry = Warning Text
               | Info Text
               | Error Text deriving Show
 
+instance Monoid LogEntry where
+  mempty = Main.Error mempty -- :)
+  Warning l `mappend` Warning r = Warning (l <> r)
+  Info l `mappend` Info r = Info (l <> r)
+  Main.Error l `mappend` Main.Error r = Main.Error (l <> r)
+
+class TextLike a where 
+  toText :: (Text -> Text) -> a -> a
+
+instance TextLike LogEntry where
+  toText f (Warning t) = Warning (f t)
+  toText f (Main.Error t) = Main.Error (f t)
+  toText f (Info t) = Info (f t)
+
+
 data IO_T = NetworkIO | ForkIO | DrawIO deriving (Eq,Ord,Enum)
 
-test = runWriterT $ runZillowM testProgram
+test = runWriterT $ runZillowM (take 10 testProgram)
 main = do
   (_,ST'{..}) <- test
   mapM print tsLogs
+-- see:  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
+-- see:  -- https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
