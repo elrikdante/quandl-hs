@@ -244,7 +244,7 @@ runZillowM jobs = do
   finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
   chan <- liftIO $ Async.newChan
   info "Scheduling Jobs"
-  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> done)
+  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
   info "Processing Started"
   jobsQueued <- liftIO $ do
     flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
@@ -254,8 +254,11 @@ runZillowM jobs = do
   info ("Beginning graph rendering")
   liftIO $ drawGraphs jobsQueued drawT chan
   info ("Waiting on Asyncs to terminate")
-  liftIO $ waitIO finalisers undefined
+  ioLog <- liftIO $ waitIO finalisers (const []) 0
+  info ("Backfilling IO Logs")
+  mapM addLog ioLog
   info ("Done")
+  done
   return tsResults
     where
       drawGraphs 0 _  _  = return ()
@@ -266,13 +269,15 @@ runZillowM jobs = do
         Async.putMVar ioQ fs
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
       {-# NOINLINE blkIO #-}
-      waitIO ioQ log = do
+      waitIO ioQ log c = do
+        la <- return (Info $ "Waiting on finaliser" <> (Data.Text.pack (show c)))
         q <- Async.takeMVar ioQ
+        lb <- return (Info $ "Done on finaliser" <> (Data.Text.pack (show c)))
         case q of
-          [] -> return ()
+          [] -> return (log []) -- extract difference list
           (f:fs) -> Async.putMVar ioQ fs *>
                     Async.takeMVar f *>
-                    waitIO ioQ log
+                    waitIO ioQ ((lb:). (la:) . log) (succ c)
       {-# NOINLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
