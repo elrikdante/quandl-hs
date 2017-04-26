@@ -136,7 +136,6 @@ quietly      = ignoreErrors
 
 type ThrottleHandle rsc = (Async.QSem,rsc)
 
-
 -- create n resource handles.
 -- the program runs concurrently but the concurrency can be limited
 -- 1 -> sequential execution
@@ -147,13 +146,6 @@ throttle n tag
   | otherwise = Async.newQSem n >>= pure . (,tag)
 
 
--- block until a handle is available, process the job and release the handle
--- this is guaranteed not to leak resources.
-tick :: forall rsc. (forall a. ThrottleHandle rsc -> IO a -> IO a)
-tick p job = Control.Exception.bracket_
-             (Async.waitQSem (fst p))
-             (Async.signalQSem (fst p))
-             job
 
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as an ascii_graph
@@ -185,7 +177,7 @@ zillowProgram ((action,code):frames)= do
   -- throttle drawing so we don't mash graphs
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
-  let go (action,code) = 
+{-  let go (action,code) = 
         let 
           frame        pipe = netT & (Async.writeChan pipe <=< flip tick (action code))
           printAnswers pipe = Async.readChan pipe >>= tick drawT  . uncurry (flip graph) . (^._Right)
@@ -196,7 +188,8 @@ zillowProgram ((action,code):frames)= do
         in (do{c <- liftIO Async.newChan
                ;liftIO (tick forkT (blkIO ((frame c *> printAnswers c)))) *> log c
                })
-  
+-}
+  let go = undefined
   (x,l) <- listen $ liftIO (action code)
   tell l
 --  sequentraverse go acts <* liftIO wait
@@ -221,21 +214,26 @@ addLog w = pass $ pure ((),(\st@(ST'{..}) -> st { tsLogs= w:tsLogs }))
 modify :: (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
 modify f = pass $ pure ((),f)
 
-update :: IO (ThreadState IO_T LogEntry -> ThreadState IO_T LogEntry) -> ZillowM LogEntry ()
-update f = do
-  st' <- liftIO f
-  modify (st')
+gets :: ZillowM w (ThreadState IO_T w)
+gets = do
+  ((),st) <- listen (pure ())
+  tell st
+  return st
 
 start,done :: ZillowM LogEntry ()
 start = do
   info "Starting ZillowM"
   modify started
-    where started st@(ST'{..}) = (st {tsinitialised = True})
+  where started st@(ST'{..}) = (st {tsinitialised = True})
 
 initThrottleHandles = do
-  mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(4,ForkIO)]
+  info "Initialising Throttle Handles"
+  ths <- liftIO (mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(7,ForkIO)])
+  info "Initialised Throttle Handles"
+  return ths
 
 done = do
+  info "All jobs completed. ZillowM Cleaning up"
   info "Finished ZillowM"
   modify fin
     where fin st@(ST'{..}) = (st {tsdone = True})
@@ -245,11 +243,60 @@ info = addLog . Info
 warn = addLog . Warning
 err  = addLog . Main.Error
 
-fork :: IO a -> ZillowM LogEntry ()
-fork a = do
+fork :: Async.MVar [Async.MVar ()] -> [ThrottleHandle IO_T] -> ZillowM LogEntry (ZillowResponse ZillowChunk) -> ZillowM LogEntry (Async.MVar ())
+fork ioQ ths a = do
   warn "Forking"
-  liftIO a
+  liftIO (print "FF")
+  (finaliser:_) <- liftM2 (:) (liftIO Async.newEmptyMVar) (liftIO (Async.takeMVar ioQ)) >>= (\q -> liftIO (return q) <* liftIO (Async.putMVar ioQ q))
+  chan <- liftIO (Async.newChan)
+  let drawT : netT : forkT : [] = ths
+--      _ = ioQ' :: a
+  tick forkT $
+    tick netT $ do
+      fork ioQ ths $ do
+        (res,st) <- liftIO (Async.readChan chan)
+        liftIO $ print "HI"
+--        info "Graphing"
+--        tick drawT (liftIO (uncurry (flip graph) . (^. _Right) $  g))
+--        info "Done Graphing"
+        return res
+      liftIO $ Async.forkIO (runWriterT a >>= Async.writeChan chan)
+{-    tick forkT (do
+                   r <- tick netT (liftIO a)
+                   info "Graphing" *> tick drawT (liftIO (uncurry (flip graph) . (^. _Right) $  r)) <* info "Done Graphing"
+                   return r
+               )
+-}
   warn "Done Forking"
+  return finaliser
+
+{-  let blkIO io = do 
+        (finaliser:_) <- liftM2 (:) Async.newEmptyMVar (Async.takeMVar ioQ) >>= (\q -> return q <* Async.putMVar ioQ q)
+        Async.forkIO (quietly io `finally` Async.putMVar finaliser ())
+-}
+-- block until a handle is available, process the job and release the handle
+-- this is guaranteed not to leak resources.
+-- without this type sig we get skolem type variable errs. :s
+tick :: ThrottleHandle IO_T -> ZillowM LogEntry a -> ZillowM LogEntry a
+tick p job = do
+
+  when (rsc == ForkIO) (info "Acquiring Fork Lock")
+  when (rsc == NetworkIO) (info "Acquiring Net Lock")
+  when (rsc == DrawIO) (info "Acquiring Draw Lock")
+
+  (r,st') <- liftIO $ Control.Exception.bracket_
+             (Async.waitQSem (fst p))
+             (Async.signalQSem (fst p))
+             (runWriterT job)
+  tell st'
+  when (rsc == ForkIO) (info "Releasing Fork Lock")
+  when (rsc == NetworkIO) (info "Releasing Net Lock")
+  when (rsc == DrawIO) (info "Releasing Draw Lock")
+
+  return r
+  where
+    (_, rsc) = p
+    _ = p  :: ThrottleHandle IO_T
 
 addRsc :: ThrottleHandle IO_T -> ZillowM LogEntry ()
 addRsc h = do
@@ -261,26 +308,35 @@ addJob rq ic = do
   info ("Scheduling: " <> Data.Text.pack(show ic))
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
 
-runJobs ((x,y):js) = do
+runJobs ioQ ths ((x,y):js) = do
+  liftIO (print "RJ")
   info ("Fetching: IC:" <> (Data.Text.pack (show y)))
-  res <- liftIO $ zillow x y
+  finaliser <- fork ioQ ths (liftIO (zillow x y))
+  ioQ' <- liftIO (Async.takeMVar ioQ >>= \q ->  Async.putMVar ioQ (finaliser:q) *> return ioQ)
+  liftIO (print "RJ2")
+  res <- return $ Left ""
   case res of
     Left _ -> warn $ "Failed to fetch" <> (Data.Text.pack (show y))
-    _      -> return ()
-  info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
+    _      -> do
+      info ("Done Fetching: IC:" <> (Data.Text.pack (show y)))
   modify (\st@(ST'{..}) -> st {tsResults= res:tsResults})
-  runJobs js
+  runJobs ioQ' ths js
 
-runJobs [] = do
-  info "All jobs completed. ZillowM Cleaning up"
+
+runJobs _ _ [] = liftIO (print "WAIT") *> gets
 
 runZillowM :: [(ZillowR,IndicatorCode)] -> ZillowM LogEntry [ZillowResponse ZillowChunk]
 runZillowM jobs = do
-  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> done)
+  when (null jobs) (error "runZillowM: Nothing to do")
+  ths <- initThrottleHandles
+  info "Intialising Finalisers"
+  finalisers  <- liftIO $ Async.newMVar [] :: ZillowM LogEntry (Async.MVar [Async.MVar ()])
+  info "Running Jobs"
+  ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start *> runJobs finalisers ths jobs *> done)
   return tsResults
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
-testProgram = take 10 $ (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
+testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on edgewater
                ++ (zip (repeat $ pg' brickellFL )   queries) -- pull latest info on brickell
                ++ (zip (repeat $ pg' losAngelesCA ) queries) -- pull latest info on LA
                ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
@@ -290,8 +346,9 @@ data LogEntry = Warning Text
               | Info Text
               | Error Text deriving Show
 
-data IO_T = NetworkIO | ForkIO | DrawIO
+data IO_T = NetworkIO | ForkIO | DrawIO deriving (Eq,Ord,Enum)
 
 test = runWriterT $ runZillowM testProgram
 main = do
-  return ()
+  (_,ST'{..}) <- test
+  mapM print tsLogs
