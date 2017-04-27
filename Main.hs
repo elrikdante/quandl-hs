@@ -278,9 +278,13 @@ runZillowM jobs = runWriterT $ do
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
   info ("Waiting on Asyncs to terminate")
-  ((ioLogG,zillowChunks),ioLogF) <- liftA2 (,) (liftIO $ drawGraphs jobsQueued forkT drawT chan id id) (liftIO $ waitIO finalisers id 0)
-  sequence_ (fmap addResult zillowChunks)
-  ((),ST'{..})    <- listen (sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG)))
+  ((ioLogG,zillowChunks),ioLogF) <- liftA2 (,)
+                                    (liftIO $ drawGraphs jobsQueued forkT drawT chan id id) 
+                                    (liftIO $ waitIO finalisers id 0)
+  ((),ST'{..})    <- listen (
+    sequence_ (fmap addResult zillowChunks) >>= \_ -> 
+      sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG))
+    )
   info ("Backfilled IO Logs")
   done
   return tsResults
@@ -306,15 +310,14 @@ runZillowM jobs = runWriterT $ do
 
 
       waitIO ioQ log c = do
-        (ql0,q,ql1) <- liftA3 (,,) 
-                       (quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c))))
-                       (Async.takeMVar ioQ)
-                       (quickLog ("Done on finaliser" <> (Data.Text.pack (show c))))
+        q <- Async.takeMVar ioQ
         case q of
           []     -> return (log []) -- extract difference list
-          (f:fs) -> Async.putMVar ioQ fs *>
-                    Async.takeMVar f *>
-                    waitIO ioQ (log . (ql0:) . (ql1:)) (succ c)
+          (f:fs) -> Async.putMVar ioQ fs                                             *>
+                    (quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c)))) >>= \lg0 -> 
+                    Async.takeMVar f                                                 *>
+                    (quickLog ("Done on finaliser" <> (Data.Text.pack (show c))))    >>= \lg1 ->
+                    waitIO ioQ (log . (lg0:) . (lg1:)) (succ c)
       {-# INLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
