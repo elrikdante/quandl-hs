@@ -273,7 +273,7 @@ runZillowM jobs = runWriterT $ do
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
   info "Processing Started"
   jobsQueued   <- liftIO $ do
-    flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
+    flip mapM_ tsJobs (\job -> blkIO finalisers forkT forkT (tick netT job >>= Async.writeChan chan))
     length <$> Async.readMVar finalisers
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
@@ -294,7 +294,7 @@ runZillowM jobs = runWriterT $ do
         (lg0,(zR,lg)) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
                         (do{Async.readChan ch >>= \g -> 
-                             tick ft (uncurry (flip graph) . (^. _Right) $ g) >>= 
+                             tick dt (uncurry (flip graph) . (^. _Right) $ g) >>= 
                              (\lg -> (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \b -> 
                                pure (g,(lg . (b:))))
                            })
@@ -348,7 +348,7 @@ instance TextLike LogEntry where
 
 data IO_T = NetworkIO | ForkIO | DrawIO deriving Show
 
-test = runZillowM (take 10 testProgram)
+test = runZillowM (testProgram)
 test2 = liftA2 (<>) (runZillowM testProgram) (runZillowM testProgram)
 main = do
   (_,ST'{..}) <- test
