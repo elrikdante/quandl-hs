@@ -280,8 +280,8 @@ runZillowM jobs = runWriterT $ do
       drawGraphs n ft dt ch log = do
         (lg0,r) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
-                        (do{Async.readChan ch >>= \g -> tick ft (uncurry (flip graph) . (^. _Right) $ g) *> quickLog ("Done Graphing" <> Data.Text.pack (show n))})
-        drawGraphs (pred n) ft dt ch (log . (lg0:) . (r:))
+                        (do{Async.readChan ch >>= \g -> tick ft (uncurry (flip graph) . (^. _Right) $ g) >>= (\lg -> (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \b -> pure (lg . (b:)))})
+        drawGraphs (pred n) ft dt ch (log . (lg0:) . r)
       {-# INLINE drawGraphs #-}
 
       blkIO ioQ fT t action = do
