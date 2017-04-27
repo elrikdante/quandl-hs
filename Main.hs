@@ -174,12 +174,12 @@ data ThreadState = ST' {
    -- ^Results of Work Queue
    }
 
-  
 instance Monoid (ThreadState) where
   mempty = ST' False False [] [] [] []
   {-# INLINE mempty #-}
   (ST' li ld lh ll ljs lr) `mappend` (ST' ri rd rh rl rjs rr) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr)
   {-# INLINE mappend #-}
+
 
 addLog :: LogEntry -> ZillowM ()
 addLog = flip addLogWithPrefix IO.getCurrentTime
@@ -190,9 +190,9 @@ addLogWithPrefix w pf = liftIO (pf                         >>=
            pure 
            . Data.Text.pack 
            . IO.formatTime IO.defaultTimeLocale "[%s%Q] ") >>= \prefix 
-           -> pass $ pure ((),(\st@(ST'{..}) 
-           -> st { tsLogs=toText (prefix<>) w : tsLogs }))
+           -> modify (\st@ST'{..} -> st { tsLogs=toText (prefix<>) w : tsLogs })
 {-# INLINE addLogWithPrefix #-}
+
 modify :: (ThreadState  -> ThreadState) -> ZillowM ()
 modify f = pass $! pure ((),  f)
 {-# INLINE modify #-}
@@ -222,15 +222,14 @@ done =
 
 info,iolog,err :: Text -> ZillowM ()
 info = addLog . Info
-iolog = addLog . IOLog
-err  = addLog . Main.Error
-
 {-# INLINE info #-}
-{-# INLINE err #-}
+iolog = addLog . IOLog
 {-# INLINE iolog #-}
+err  = addLog . Main.Error
+{-# INLINE err #-}
+
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
--- without this type sig we get skolem type variable errs. :s
 tick :: ThrottleHandle IO_T -> IO a -> IO a
 tick p job =Control.Exception.bracket_
             (Async.waitQSem (fst p))
@@ -249,6 +248,15 @@ addJob rq ic =
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
 {-# INLINE addJob #-}
 
+addResult :: ZillowResponse ZillowChunk -> ZillowM ()
+addResult c =
+  info ("Recording: " <> tag c)                          *>
+  modify (\st@(ST'{..}) -> st {tsResults= c:tsResults})
+  where
+    tag (Left e)         = "Failure: " <> e
+    tag (Right (zc,~_))  = "Success: " <> zc
+{-# INLINE addResult #-}
+
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
@@ -259,7 +267,7 @@ runZillowM jobs = runWriterT $ do
   drawT : netT : forkT : [] <- initThrottleHandles
   liftIO $ IO.hSetBuffering IO.stdout IO.NoBuffering
   info "Intialising Finalisers"
-  finalisers  <- liftIO $ Async.newMVar [] :: ZillowM (Async.MVar [Async.MVar ()])
+  finalisers   <- liftIO $ Async.newMVar [] :: ZillowM (Async.MVar [Async.MVar ()])
   chan <- liftIO $ Async.newChan
   info "Scheduling Jobs"
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
@@ -270,18 +278,23 @@ runZillowM jobs = runWriterT $ do
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
   info ("Waiting on Asyncs to terminate")
-  (ioLogG,ioLogF) <- Turtle.liftA2 (,) (liftIO $ drawGraphs jobsQueued forkT drawT chan id) (liftIO $ waitIO finalisers id 0)
-  ((),ST'{..}) <- listen (sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG)))
+  ((ioLogG,zillowChunks),ioLogF) <- liftA2 (,) (liftIO $ drawGraphs jobsQueued forkT drawT chan id id) (liftIO $ waitIO finalisers id 0)
+  sequence_ (fmap addResult zillowChunks)
+  ((),ST'{..})    <- listen (sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG)))
   info ("Backfilled IO Logs")
   done
   return tsResults
     where
-      drawGraphs 0 ft _  _  log = pure (log [])
-      drawGraphs n ft dt ch log = do
-        (lg0,r) <- liftA2 (,)
+      drawGraphs 0 ft _  _  log rs= pure (log [], rs [])
+      drawGraphs n ft dt ch log rs= do
+        (lg0,(zR,lg)) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
-                        (do{Async.readChan ch >>= \g -> tick ft (uncurry (flip graph) . (^. _Right) $ g) >>= (\lg -> (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \b -> pure (lg . (b:)))})
-        drawGraphs (pred n) ft dt ch (log . (lg0:) . r)
+                        (do{Async.readChan ch >>= \g -> 
+                             tick ft (uncurry (flip graph) . (^. _Right) $ g) >>= 
+                             (\lg -> (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \b -> 
+                               pure (g,(lg . (b:))))
+                           })
+        drawGraphs (pred n) ft dt ch (log . (lg0:) . lg) (rs . (zR:))
       {-# INLINE drawGraphs #-}
 
       blkIO ioQ fT t action = do
@@ -298,7 +311,7 @@ runZillowM jobs = runWriterT $ do
                        (Async.takeMVar ioQ)
                        (quickLog ("Done on finaliser" <> (Data.Text.pack (show c))))
         case q of
-          [] -> return (log []) -- extract difference list
+          []     -> return (log []) -- extract difference list
           (f:fs) -> Async.putMVar ioQ fs *>
                     Async.takeMVar f *>
                     waitIO ioQ (log . (ql0:) . (ql1:)) (succ c)
@@ -324,8 +337,6 @@ instance Monoid LogEntry where
 class TextLike a where 
   toText :: (Text -> Text) -> a -> a
 
-
-
 instance TextLike LogEntry where
   toText f (IOLog t) = IOLog (f t)
   toText f (Main.Error t) = Main.Error (f t)
@@ -334,9 +345,11 @@ instance TextLike LogEntry where
 
 data IO_T = NetworkIO | ForkIO | DrawIO
 
-test = runZillowM testProgram
+test = runZillowM (take 10 testProgram)
+test2 = liftA2 (<>) (runZillowM testProgram) (runZillowM testProgram)
 main = do
   (_,ST'{..}) <- test
   mapM print tsLogs
+  mapM print tsResults
 -- see:  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
 -- see:  -- https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
