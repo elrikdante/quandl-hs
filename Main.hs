@@ -267,7 +267,7 @@ runZillowM jobs = runWriterT $ do
   drawT : netT : forkT : [] <- initThrottleHandles
   liftIO $ IO.hSetBuffering IO.stdout IO.NoBuffering
   info "Intialising Finalisers"
-  finalisers   <- liftIO $ Async.newMVar [] :: ZillowM (Async.MVar [Async.MVar ()])
+  finalisers   <- liftIO $ Async.newMVar [] :: ZillowM (Async.MVar [Async.MVar IO_T])
   chan <- liftIO $ Async.newChan
   info "Scheduling Jobs"
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
@@ -305,7 +305,7 @@ runZillowM jobs = runWriterT $ do
         -- Copied from: [2] - just formatted to my preference
         fs@(f:_) <- liftA2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
         Async.putMVar ioQ fs                                            
-        tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
+        tick fT (Async.forkIO (tick t action `finally` Async.putMVar f (snd t)))
       {-# INLINE blkIO #-}
 
 
@@ -313,10 +313,10 @@ runZillowM jobs = runWriterT $ do
         q <- Async.takeMVar ioQ
         case q of
           []     -> return (log []) -- extract difference list
-          (f:fs) -> Async.putMVar ioQ fs                                             *>
-                    (quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c)))) >>= \lg0 -> 
-                    Async.takeMVar f                                                 *>
-                    (quickLog ("Done on finaliser" <> (Data.Text.pack (show c))))    >>= \lg1 ->
+          (f:fs) -> Async.putMVar ioQ fs                                                            *>
+                    (quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c))))                >>= \lg0 -> 
+                    Async.takeMVar f                                                                >>= \ioT ->
+                    (quickLog ("Done on finaliser" <> (Data.Text.pack (show c ++ " " ++ show ioT))))>>= \lg1 ->
                     waitIO ioQ (log . (lg0:) . (lg1:)) (succ c)
       {-# INLINE waitIO #-}
 
@@ -346,7 +346,7 @@ instance TextLike LogEntry where
   toText f (Info t) = Info (f t)
   {-# INLINE toText #-}
 
-data IO_T = NetworkIO | ForkIO | DrawIO
+data IO_T = NetworkIO | ForkIO | DrawIO deriving Show
 
 test = runZillowM (take 10 testProgram)
 test2 = liftA2 (<>) (runZillowM testProgram) (runZillowM testProgram)
