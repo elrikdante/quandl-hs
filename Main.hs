@@ -194,7 +194,7 @@ addLogWithPrefix w pf = liftIO (pf                         >>=
 {-# INLINE addLogWithPrefix #-}
 
 modify :: (ThreadState  -> ThreadState) -> ZillowM ()
-modify f = pass $! pure ((),  f)
+modify f = pass $! pure ((), f)
 {-# INLINE modify #-}
 
 start,done :: ZillowM ()
@@ -209,7 +209,7 @@ initThrottleHandles = do
   -- throttle forking because we don't want to spike memory
   -- throttle network too as quandl's API doesn't like being hammered
   info "Initialising Throttle Handles"
-  ths <- liftIO (mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(8,ForkIO)])
+  ths <- liftIO (mapM (uncurry throttle) [(1,DrawIO),(2,NetworkIO),(4,ForkIO)])
   info "Initialised Throttle Handles"
   return ths
 
@@ -273,7 +273,7 @@ runZillowM jobs = runWriterT $ do
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
   info "Processing Started"
   jobsQueued   <- liftIO $ do
-    flip mapM_ tsJobs (\job -> blkIO finalisers drawT netT (job >>= Async.writeChan chan))
+    flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
     length <$> Async.readMVar finalisers
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
@@ -293,8 +293,8 @@ runZillowM jobs = runWriterT $ do
       drawGraphs n ft _dt ch log rs= do
         (lg0,(zR,lg)) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
-                        (do{Async.readChan ch >>= \g -> 
-                             (uncurry (flip graph) . (^. _Right) $ g) >>= 
+                        (do{Async.readChan ch                                                >>= \g -> 
+                             (uncurry (flip graph) . (^. _Right) $ g)                        >>= 
                              (\lg -> (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \b -> 
                                pure (g,(lg . (b:))))
                            })
