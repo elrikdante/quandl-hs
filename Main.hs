@@ -273,7 +273,7 @@ runZillowM jobs = runWriterT $ do
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
   info "Processing Started"
   jobsQueued   <- liftIO $ do
-    flip mapM_ tsJobs (\job -> blkIO finalisers forkT forkT (tick netT job >>= Async.writeChan chan))
+    flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
     length <$> Async.readMVar finalisers
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
