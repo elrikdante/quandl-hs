@@ -1,5 +1,6 @@
 #!/usr/bin/env stack
 {- --package-mtl-2.2.1 --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
+-- Copyright 2017 - Present Dante Elrik
 {-# LANGUAGE RankNTypes,FlexibleInstances,OverloadedStrings,ScopedTypeVariables,TupleSections, FlexibleContexts,MultiParamTypeClasses,RecordWildCards #-}
 module Main where
 import qualified Network.Wreq
@@ -42,7 +43,14 @@ type QuandlCode   = Text
 type Page         = Int
 type Log          = [LogEntry]
 
+-- The ZillowM process has a Write-Only `ThreadState` and delivers a `b`
 type ZillowM b = WriterT ThreadState IO b
+
+data ZillowR = ZData Page ZCode -- A request for information from Zillows db
+
+type ZillowResponse b = Either Error b
+type ZillowChunk = (QuandlCode,LBS.ByteString)
+type Error = Text
 
 data ZCode   = ZCode {
   areaCategory:: AreaCategory
@@ -86,11 +94,6 @@ data IndicatorCode = IC_A   -- --- All Homes
 instance Show ZCode where
   show z@(ZCode ac c qc) = concat (Data.Text.unpack <$> [ac,c])
 
-data ZillowR = ZData Page ZCode -- A request for information from Zillows db
-
-type ZillowResponse b = Either Error b
-type ZillowChunk = (QuandlCode,LBS.ByteString)
-type Error = Text
 
 -- emptyZCode :: Initialise a zillow code using area category and code
 emptyZCode :: AreaCategory -> AreaCode -> ZCode
@@ -154,23 +157,34 @@ throttle n tag
   | n < 1     = error "throttle. : allocating 0 is fun if you like playing with blocked threads =)"
   | otherwise = Async.newQSem n >>= pure . (,tag)
 
+-- computations can modify but not read `ThreadState`.
+-- push and toggle based state manipulations
 data ThreadState = ST' {
   tsinitialised :: Bool
-  ,tsdone :: Bool
-  ,tsHandles :: [ThrottleHandle IO_T]
-  ,tsLogs :: Log
-  ,tsJobs :: [IO (ZillowResponse ZillowChunk)]
-  ,tsResults :: [ZillowResponse ZillowChunk]
+  -- ^Whether or not we've initialised this thread via runZillowM
+  ,tsdone       :: Bool
+  -- ^Whether or not we've processed all jobs
+  ,tsHandles    :: [ThrottleHandle IO_T]
+  -- ^Handles for managing the different kinds of IO during job processing
+  ,tsLogs       :: Log
+  -- ^Ledger of all events
+  ,tsJobs       :: [IO (ZillowResponse ZillowChunk)]
+  -- ^Work Queue
+  ,tsResults    :: [ZillowResponse ZillowChunk]
+   -- ^Results of Work Queue
    }
 
   
 instance Monoid (ThreadState) where
   mempty = ST' False False [] [] [] []
+  {-# INLINE mempty #-}
   (ST' li ld lh ll ljs lr) `mappend` (ST' ri rd rh rl rjs rr) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr)
+  {-# INLINE mappend #-}
 
 addLog :: LogEntry -> ZillowM ()
-addLog w = addLogWithPrefix w IO.getCurrentTime
+addLog = flip addLogWithPrefix IO.getCurrentTime
 {-# INLINE addLog #-}
+
 addLogWithPrefix :: LogEntry -> IO IO.UTCTime ->  ZillowM ()
 addLogWithPrefix w pf = liftIO (pf                         >>=
            pure 
@@ -183,17 +197,12 @@ modify :: (ThreadState  -> ThreadState) -> ZillowM ()
 modify f = pass $! pure ((),  f)
 {-# INLINE modify #-}
 
-gets :: ZillowM (ThreadState)
-gets = do
-  (r,st) <- listen (pure ())
-  tell st
-  return st
-
 start,done :: ZillowM ()
 start = do
   info "Starting ZillowM"
   modify started
   where started st@(ST'{..}) = (st {tsinitialised = True})
+{-# INLINE start #-}
 
 initThrottleHandles = do
   -- throttle drawing so we don't mash graphs
@@ -209,12 +218,16 @@ done = do
   modify fin
   info "Finished ZillowM"
     where fin st@(ST'{..}) = (st {tsdone = True})
+{-# INLINE done #-}
 
 info,iolog,err :: Text -> ZillowM ()
 info = addLog . Info
 iolog = addLog . IOLog
 err  = addLog . Main.Error
 
+{-# INLINE info #-}
+{-# INLINE err #-}
+{-# INLINE iolog #-}
 -- block until a handle is available, process the job and release the handle
 -- this is guaranteed not to leak resources.
 -- without this type sig we get skolem type variable errs. :s
@@ -234,6 +247,8 @@ addJob :: ZillowR -> IndicatorCode -> ZillowM ()
 addJob rq ic = do
   info ("Scheduling: " <> Data.Text.pack(show ic))
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
+{-# INLINE addJob #-}
+
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
@@ -256,9 +271,9 @@ runZillowM jobs = runWriterT $ do
   info ("Beginning graph rendering")
   info ("Waiting on Asyncs to terminate")
   (ioLogG,ioLogF) <- Turtle.liftA2 (,) (liftIO $ drawGraphs jobsQueued forkT drawT chan id) (liftIO $ waitIO finalisers id 0)
+  ((),ST'{..}) <- listen (sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG)))
   info ("Backfilled IO Logs")
   done
-  ((),ST'{..}) <- listen (sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG)))
   return tsResults
     where
       drawGraphs 0 ft _  _  log = pure (log [])
@@ -270,7 +285,7 @@ runZillowM jobs = runWriterT $ do
       {-# INLINE drawGraphs #-}
 
       blkIO ioQ fT t action = do
-        -- Copied from: [1] - just formatted to my preference
+        -- Copied from: [2] - just formatted to my preference
         fs@(f:_) <- liftA2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
         Async.putMVar ioQ fs
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
@@ -298,7 +313,7 @@ testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on 
 
 data LogEntry = IOLog Text
               | Info Text
-              | Error Text deriving (Show,Ord,Eq)
+              | Error Text deriving Show
 
 instance Monoid LogEntry where
   mempty = Main.Error mempty -- :)
@@ -317,7 +332,7 @@ instance TextLike LogEntry where
   toText f (Info t) = Info (f t)
   {-# INLINE toText #-}
 
-data IO_T = NetworkIO | ForkIO | DrawIO deriving (Eq,Ord,Enum)
+data IO_T = NetworkIO | ForkIO | DrawIO
 
 test = runZillowM testProgram
 main = do
