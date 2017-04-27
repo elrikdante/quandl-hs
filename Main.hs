@@ -1,5 +1,5 @@
 #!/usr/bin/env stack
-{- --package-mtl-2.2.1 --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
+{- --resolver lts-6.2 --package-mtl-2.2.1 --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
 -- Copyright 2017 - Present Dante Elrik
 {-# LANGUAGE RankNTypes,FlexibleInstances,OverloadedStrings,ScopedTypeVariables,TupleSections, FlexibleContexts,MultiParamTypeClasses,RecordWildCards #-}
 module Main where
