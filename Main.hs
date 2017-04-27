@@ -9,8 +9,8 @@ import qualified Data.Vector
 import Data.Text(Text)
 import qualified Data.Text
 import qualified Data.ByteString.Lazy as LBS
-import qualified Data.HashMap.Strict as HM
-import qualified Data.Text.IO as Data.Text
+import qualified Data.HashMap.Strict  as HM
+import qualified Data.Text.IO       as Data.Text
 import qualified Data.Text.Encoding as LData.Text
 import qualified Data.Text.Lazy     as LData.Text
 import Data.Function ((&))
@@ -24,8 +24,8 @@ import Control.Monad
 import Data.Aeson.Types
 import Data.Monoid(mappend,(<>))
 import Data.Either(rights)
-import qualified Control.Concurrent.QSem as Async
-import qualified Control.Concurrent      as Async
+import qualified Control.Concurrent.QSem  as Async
+import qualified Control.Concurrent       as Async
 import qualified Control.Concurrent.Async as Async
 import qualified Turtle
 import Turtle((<=<),(<|>))
@@ -213,10 +213,10 @@ initThrottleHandles = do
   info "Initialised Throttle Handles"
   return ths
 
-done = do
-  info "All jobs completed. ZillowM Cleaning up"
-  modify fin
-  info "Finished ZillowM"
+done = 
+  info "All jobs completed. ZillowM Cleaning up" *>
+  modify fin                                     *>
+  info "Finished ZillowM"           
     where fin st@(ST'{..}) = (st {tsdone = True})
 {-# INLINE done #-}
 
@@ -239,13 +239,13 @@ tick p job =Control.Exception.bracket_
 {-# INLINE tick #-}
 
 addRsc :: ThrottleHandle IO_T -> ZillowM ()
-addRsc h = do
-  iolog "Registering Throttle Handle"
+addRsc h =
+  iolog "Registering Throttle Handle"                    *>
   modify (\st@(ST'{..}) -> st { tsHandles= h:tsHandles })
 
 addJob :: ZillowR -> IndicatorCode -> ZillowM ()
-addJob rq ic = do
-  info ("Scheduling: " <> Data.Text.pack(show ic))
+addJob rq ic =
+  info ("Scheduling: " <> Data.Text.pack(show ic))           *>
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
 {-# INLINE addJob #-}
 
@@ -287,7 +287,7 @@ runZillowM jobs = runWriterT $ do
       blkIO ioQ fT t action = do
         -- Copied from: [2] - just formatted to my preference
         fs@(f:_) <- liftA2 (:) (Async.newEmptyMVar) (Async.takeMVar ioQ)
-        Async.putMVar ioQ fs
+        Async.putMVar ioQ fs                                            
         tick fT (Async.forkIO (tick t action `finally` Async.putMVar f ()))
       {-# INLINE blkIO #-}
 
