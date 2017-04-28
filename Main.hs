@@ -17,13 +17,12 @@ import Data.Function ((&))
 import Control.Lens((^.),_Right,view,over)
 import Control.Applicative(liftA3,liftA2)
 import Control.Exception(catch,SomeException,bracket_,finally,handle)
-import Data.Aeson
+import Data.Aeson hiding (Error)
 import Data.List(sortOn)
 import Data.Maybe(mapMaybe,fromJust)
 import Control.Monad
-import Data.Aeson.Types
 import Data.Monoid(mappend,(<>))
-import Data.Either(rights)
+import Data.Either(rights,lefts)
 import qualified Control.Concurrent.QSem  as Async
 import qualified Control.Concurrent       as Async
 import qualified Control.Concurrent.Async as Async
@@ -37,20 +36,19 @@ import qualified Data.Time.Format   as IO
 import qualified Debug.Trace        as DT
 import Control.Monad.Writer.Lazy
 
-type AreaCategory = Text
-type AreaCode     = Text
-type QuandlCode   = Text
-type Page         = Int
-type Log          = [LogEntry]
+type AreaCategory   = Text
+type AreaCode       = Text
+type QuandlCode     = Text
+type Page           = Int
+type Log            = [LogEntry]
+type ZillowResponse = Either Error Chunk
+type Chunk          = (QuandlCode,LBS.ByteString)
+type Error          = Text
 
 -- The ZillowM process has a Write-Only `ThreadState` and delivers a `b`
 type ZillowM b = WriterT ThreadState IO b
 
 data ZillowR = ZData Page ZCode -- A request for information from Zillows db
-
-type ZillowResponse b = Either Error b
-type ZillowChunk = (QuandlCode,LBS.ByteString)
-type Error = Text
 
 data ZCode   = ZCode {
   areaCategory:: AreaCategory
@@ -107,7 +105,7 @@ losAngelesCA  = emptyZCode "N" "00014"
 
 
 
-zillow :: ZillowR -> IndicatorCode -> IO (ZillowResponse ZillowChunk)
+zillow :: ZillowR -> IndicatorCode -> IO ZillowResponse
 zillow (ZData page code) ic = ((Network.Wreq.get url) >>= (pure . Right . (qcode,) . (^. Network.Wreq.responseBody))) 
                               `Control.Exception.catch`  --catch exceptions.
                               (\(_::SomeException) -> return (Left ("Zillow Err: " <> qcode)))
@@ -168,9 +166,9 @@ data ThreadState = ST' {
   -- ^Handles for managing the different kinds of IO during job processing
   ,tsLogs       :: Log
   -- ^Ledger of all events
-  ,tsJobs       :: [IO (ZillowResponse ZillowChunk)]
+  ,tsJobs       :: [IO ZillowResponse]
   -- ^Work Queue
-  ,tsResults    :: [ZillowResponse ZillowChunk]
+  ,tsResults    :: [ZillowResponse]
    -- ^Results of Work Queue
    }
 
@@ -248,20 +246,20 @@ addJob rq ic =
   modify (\st@(ST'{..}) -> st {tsJobs= zillow rq ic:tsJobs})
 {-# INLINE addJob #-}
 
-addResult :: ZillowResponse ZillowChunk -> ZillowM ()
+addResult :: ZillowResponse -> ZillowM ()
 addResult c =
   info ("Recording: " <> tag c)                          *>
   modify (\st@(ST'{..}) -> st {tsResults= c:tsResults})
   where
     tag (Left e)         = "Failure: " <> e
-    tag (Right (zc,~_))  = "Success: " <> zc
+    tag (Right (zc,_))  = "Success: " <> zc
 {-# INLINE addResult #-}
 
 -- run a set of queries againsts Zillow's Quandl Database.
 -- each query will be printed as an ascii_graph
 -- some queries may fail, there is no retry.
 
-runZillowM :: [(ZillowR,IndicatorCode)] -> IO ([ZillowResponse ZillowChunk],ThreadState)
+runZillowM :: [(ZillowR,IndicatorCode)] -> IO ([ZillowResponse],ThreadState)
 runZillowM jobs = runWriterT $ do
   when (null jobs) (error "runZillowM: Nothing to do")
   drawT : netT : forkT : [] <- initThrottleHandles
@@ -293,10 +291,10 @@ runZillowM jobs = runWriterT $ do
       drawGraphs n ft _dt ch log rs= do
         (lg0,(zR,lg)) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
-                        (do{Async.readChan ch                                                >>= \g -> 
-                             (uncurry (flip graph) . (^. _Right) $ g)                        >>= 
-                             (\lg -> (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \b -> 
-                               pure (g,(lg . (b:))))
+                        (do{Async.readChan ch                                        >>= \chunk -> 
+                             tick _dt (uncurry (flip graph) . (^. _Right) $ chunk)   >>= \lga   -> 
+                             (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \lgb   -> 
+                             pure (chunk,(lga . (lgb:)))
                            })
         drawGraphs (pred n) ft _dt ch (log . (lg0:) . lg) (rs . (zR:))
       {-# INLINE drawGraphs #-}
@@ -328,8 +326,8 @@ testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on 
                ++ (zip (repeat $ pg' c0 ) queries)
 
 data LogEntry = IOLog Text
-              | Info Text
-              | Error Text deriving Show
+              | Info  Text
+              | Error Error deriving Show
 
 instance Monoid LogEntry where
   mempty = Main.Error mempty -- :)
@@ -342,7 +340,7 @@ class TextLike a where
 
 instance TextLike LogEntry where
   toText f (IOLog t) = IOLog (f t)
-  toText f (Main.Error t) = Main.Error (f t)
+  toText f (Error t) = Error (f t)
   toText f (Info t) = Info (f t)
   {-# INLINE toText #-}
 
@@ -353,6 +351,13 @@ test2 = liftA2 (<>) (runZillowM testProgram) (runZillowM testProgram)
 main = do
   (_,ST'{..}) <- test
   mapM print tsLogs
-  mapM print tsResults
+  let (_,fails,succs,all) = (,,,) 
+                          <*> length . lefts
+                          <*> length . rights
+                          <*> length $
+                          tsResults
+  print . ("Errors: "++) . show $ fails
+  print . ("OK: "++)     . show $ succs
+  print . ("Total: "++)  . show  $ all
 -- see:  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
 -- see:  -- https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
