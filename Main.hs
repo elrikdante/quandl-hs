@@ -141,7 +141,7 @@ apiKey       = IO.unsafePerformIO (IO.getEnv "QUANDL_API_KEY") -- quandl support
 ignoreErrors = Control.Exception.handle (\(_::SomeException) -> return ())
 quietly      = ignoreErrors
 
-quickLog = liftA2 (,) IO.getCurrentTime . pure . IOLog
+quickLog = liftA2 (,) IO.getCurrentTime . pure . IOL
 {-# INLINE quickLog #-}
 
 type ThrottleHandle rsc = (Async.QSem,rsc)
@@ -170,18 +170,22 @@ data ThreadState = ST' {
   -- ^Work Queue
   ,tsResults    :: [ZillowResponse]
    -- ^Results of Work Queue
+  ,tsRuntime    :: IO.NominalDiffTime
    }
 
 instance Monoid (ThreadState) where
-  mempty = ST' False False [] [] [] []
+  mempty = ST' False False [] [] [] [] 0
   {-# INLINE mempty #-}
-  (ST' li ld lh ll ljs lr) `mappend` (ST' ri rd rh rl rjs rr) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr)
+  (ST' li ld lh ll ljs lr lrt) `mappend` (ST' ri rd rh rl rjs rr rrt) = ST' (li || ri) (ld && rd) (lh++rh) (ll++rl) (ljs ++ rjs) (lr++rr) (lrt + rrt)
   {-# INLINE mappend #-}
 
 
 addLog :: LogEntry -> ZillowM ()
 addLog = flip addLogWithPrefix IO.getCurrentTime
 {-# INLINE addLog #-}
+
+setRuntime :: IO.NominalDiffTime -> ZillowM ()
+setRuntime rt = modify (\st@ST'{..} -> st {tsRuntime=rt})
 
 addLogWithPrefix :: LogEntry -> IO IO.UTCTime ->  ZillowM ()
 addLogWithPrefix w pf = liftIO (pf                         >>=
@@ -219,11 +223,11 @@ done =
 {-# INLINE done #-}
 
 info,iolog,err :: Text -> ZillowM ()
-info = addLog . Info
+info = addLog . I
 {-# INLINE info #-}
-iolog = addLog . IOLog
+iolog = addLog . IOL
 {-# INLINE iolog #-}
-err  = addLog . Main.Error
+err  = addLog . E
 {-# INLINE err #-}
 
 -- block until a handle is available, process the job and release the handle
@@ -262,6 +266,7 @@ addResult c =
 runZillowM :: [(ZillowR,IndicatorCode)] -> IO ([ZillowResponse],ThreadState)
 runZillowM jobs = runWriterT $ do
   when (null jobs) (error "runZillowM: Nothing to do")
+  startAt <- Turtle.date
   drawT : netT : forkT : [] <- initThrottleHandles
   liftIO $ IO.hSetBuffering IO.stdout IO.NoBuffering
   info "Intialising Finalisers"
@@ -284,6 +289,8 @@ runZillowM jobs = runWriterT $ do
       sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG))
     )
   info ("Backfilled IO Logs")
+  endAt <- Turtle.date
+  setRuntime (flip IO.diffUTCTime startAt endAt)
   done
   return tsResults
     where
@@ -325,23 +332,23 @@ testProgram = (zip (repeat $ pg' edgewaterFL)   queries) -- pull latest info on 
                ++ (zip (repeat $ pg' expositionCA ) queries) -- pull latest info on Exposition,LA
                ++ (zip (repeat $ pg' c0 ) queries)
 
-data LogEntry = IOLog Text
-              | Info  Text
-              | Error Error deriving Show
+data LogEntry = IOL Text
+              | I  Text
+              | E  Error deriving Show
 
 instance Monoid LogEntry where
-  mempty = Main.Error mempty -- :)
-  IOLog l `mappend` IOLog r = IOLog (l <> r)
-  Info l `mappend` Info r = Info (l <> r)
-  Main.Error l `mappend` Main.Error r = Main.Error (l <> r)
+  mempty = E mempty -- :)
+  IOL l `mappend` IOL r = IOL (l <> r)
+  I l `mappend` I r = I (l <> r)
+  E l `mappend` E r = E (l <> r)
 
 class TextLike a where 
   toText :: (Text -> Text) -> a -> a
 
 instance TextLike LogEntry where
-  toText f (IOLog t) = IOLog (f t)
-  toText f (Error t) = Error (f t)
-  toText f (Info t) = Info (f t)
+  toText f (IOL t) = IOL (f t)
+  toText f (E t) = E (f t)
+  toText f (I t) = I (f t)
   {-# INLINE toText #-}
 
 data IO_T = NetworkIO | ForkIO | DrawIO deriving Show
@@ -359,5 +366,6 @@ main = do
   print . ("Errors: "++) . show $ fails
   print . ("OK: "++)     . show $ succs
   print . ("Total: "++)  . show  $ all
+  print . ("Runtime: " ++) . show $ tsRuntime
 -- see:  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
 -- see:  -- https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
