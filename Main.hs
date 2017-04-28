@@ -286,7 +286,7 @@ runZillowM jobs = runWriterT $ do
                                     (liftIO $ waitIO finalisers id 0)
   ((),ST'{..})    <- listen (
     sequence_ (fmap addResult zillowChunks) >>= \_ -> 
-      sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogF++ioLogG))
+      sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst $ (ioLogG $ ioLogF $ []))
     )
   info ("Backfilled IO Logs")
   endAt <- Turtle.date
@@ -294,16 +294,16 @@ runZillowM jobs = runWriterT $ do
   done
   return tsResults
     where
-      drawGraphs 0 ft _  _  log rs= pure (log [], rs [])
-      drawGraphs n ft _dt ch log rs= do
+      drawGraphs 0 ft _  _  iolog rs= pure (iolog, rs [])
+      drawGraphs n ft _dt ch iolog rs= do
         (lg0,(zR,lg)) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
-                        (do{Async.readChan ch                                        >>= \chunk -> 
-                             tick _dt (uncurry (flip graph) . (^. _Right) $ chunk)   >>= \lga   -> 
-                             (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \lgb   -> 
+                        (do{Async.readChan ch                                        >>= \chunk  -> 
+                             tick _dt (uncurry (flip graph) . (^. _Right) $ chunk)   >>= \lga -> 
+                             (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \lgb -> 
                              pure (chunk,(lga . (lgb:)))
                            })
-        drawGraphs (pred n) ft _dt ch (log . (lg0:) . lg) (rs . (zR:))
+        drawGraphs (pred n) ft _dt ch (iolog . (lg0:) . lg) (rs . (zR:))
       {-# INLINE drawGraphs #-}
 
       blkIO ioQ fT t action = do
@@ -314,15 +314,15 @@ runZillowM jobs = runWriterT $ do
       {-# INLINE blkIO #-}
 
 
-      waitIO ioQ log c = do
+      waitIO ioQ iolog c = do
         q <- Async.takeMVar ioQ
         case q of
-          []     -> return (log []) -- extract difference list
+          []     -> return iolog
           (f:fs) -> Async.putMVar ioQ fs                                                            *>
                     (quickLog ("Waiting on finaliser" <> (Data.Text.pack (show c))))                >>= \lg0 -> 
                     Async.takeMVar f                                                                >>= \ioT ->
                     (quickLog ("Done on finaliser" <> (Data.Text.pack (show c ++ " " ++ show ioT))))>>= \lg1 ->
-                    waitIO ioQ (log . (lg0:) . (lg1:)) (succ c)
+                    waitIO ioQ (iolog . (lg0:) . (lg1:)) (succ c)
       {-# INLINE waitIO #-}
 
 queries = [(minBound :: IndicatorCode) .. ] -- let's see what all the tables look like
