@@ -1,7 +1,7 @@
 #!/usr/bin/env stack
 {- --resolver lts-6.2 --package-mtl-2.2.1 --package text --package bytestring --package turtle --package wreq  --pacakge lens --package aeson --package unordered-containers --package containers -}
 -- Copyright 2017 - Present Dante Elrik
-{-# LANGUAGE RankNTypes,FlexibleInstances,OverloadedStrings,ScopedTypeVariables,TupleSections, FlexibleContexts,MultiParamTypeClasses,RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings,ScopedTypeVariables,TupleSections,RecordWildCards #-}
 module Main where
 import qualified Network.Wreq
 import Data.Vector (Vector)
@@ -33,7 +33,6 @@ import qualified System.IO          as IO
 import System.IO.Unsafe             as IO
 import qualified Data.Time.Clock    as IO
 import qualified Data.Time.Format   as IO
-import qualified Debug.Trace        as DT
 import Control.Monad.Writer.Lazy
 
 type AreaCategory   = Text
@@ -276,7 +275,7 @@ runZillowM jobs = runWriterT $ do
   ((),ST'{..}) <- listen (sequence_ (uncurry addJob <$> jobs) *> start)
   info "Processing Started"
   jobsQueued   <- liftIO $ do
-    flip mapM_ tsJobs (\job -> blkIO finalisers forkT netT (job >>= Async.writeChan chan))
+    flip mapM_ tsJobs (\job -> blkIO finalisers forkT drawT (blkIO finalisers forkT netT (job >>= Async.writeChan chan) *> pure ()))
     length <$> Async.readMVar finalisers
   info ("Queued: " <> Data.Text.pack (show jobsQueued))
   info ("Beginning graph rendering")
@@ -286,7 +285,7 @@ runZillowM jobs = runWriterT $ do
                                     (liftIO $ waitIO finalisers id 0)
   ((),ST'{..})    <- listen (
     sequence_ (fmap addResult zillowChunks) >>= \_ -> 
-      sequence_ $ (\(t,l) -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst $ (ioLogG $ ioLogF $ []))
+    sequence_ $ (\(t,l)                            -> addLogWithPrefix l (pure t)) <$> (Data.List.sortOn fst (ioLogG $ ioLogF $ []))
     )
   info ("Backfilled IO Logs")
   endAt <- Turtle.date
@@ -299,8 +298,8 @@ runZillowM jobs = runWriterT $ do
         (lg0,(zR,lg)) <- liftA2 (,)
                         (quickLog ("Graphing" <> Data.Text.pack (show n)))
                         (do{Async.readChan ch                                        >>= \chunk  -> 
-                             tick _dt (uncurry (flip graph) . (^. _Right) $ chunk)   >>= \lga -> 
-                             (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \lgb -> 
+                             tick _dt (uncurry (flip graph) . (^. _Right) $ chunk)   >>= \lga    -> 
+                             (quickLog ("Done Graphing" <> Data.Text.pack (show n))) >>= \lgb    -> 
                              pure (chunk,(lga . (lgb:)))
                            })
         drawGraphs (pred n) ft _dt ch (iolog . (lg0:) . lg) (rs . (zR:))
@@ -356,16 +355,17 @@ data IO_T = NetworkIO | ForkIO | DrawIO deriving Show
 test = runZillowM (testProgram)
 test2 = liftA2 (<>) (runZillowM testProgram) (runZillowM testProgram)
 main = do
-  (_,ST'{..}) <- test
+  (chunks,ST'{..}) <- test
   mapM print tsLogs
   let (_,fails,succs,all) = (,,,) 
                           <*> length . lefts
                           <*> length . rights
                           <*> length $
-                          tsResults
+                          chunks
   print . ("Errors: "++) . show $ fails
   print . ("OK: "++)     . show $ succs
   print . ("Total: "++)  . show  $ all
   print . ("Runtime: " ++) . show $ tsRuntime
+
 -- see:  -- https://mail.haskell.org/pipermail/glasgow-haskell-users/2012-July/022651.html
 -- see:  -- https://hackage.haskell.org/package/base-4.9.1.0/docs/Control-Concurrent.html note on Pre-Emption
